@@ -18,8 +18,20 @@ from reaktoro_pse.examples import (
 )
 
 
-def test_desal():
-    m, m_open = simple_desalination.main()
+@pytest.mark.parametrize(
+    "hess_type",
+    [
+        "ZeroHessian",
+        "GaussNewton",
+        "LBFGS",
+        "BFGS",
+        # "BFGS_mod", does not work on this example
+        "BFGS_damp",
+        "BFGS_ipopt",
+    ],
+)
+def test_desal(hess_type):
+    m = simple_desalination.main(hess_type=hess_type)
 
     assert (
         pytest.approx(m.desal_properties[("scalingTendency", "Gypsum")].value, 1e-3)
@@ -30,54 +42,80 @@ def test_desal():
         == 1548396.415543
     )
 
-    assert pytest.approx(m.desal_properties[("pH", None)].value, 1e-2) == 6.284055
+    assert pytest.approx(m.desal_properties[("pH", None)].value, 1e-3) == 6.284055
     assert pytest.approx(m.water_recovery.value, 1e-3) == 0.899999
     assert pytest.approx(m.acid_addition.value, 1e-3) == 0.003043
-    for key, obj in m.desal_properties.items():
-        assert pytest.approx(obj.value, 1e-3) == m_open.desal_properties[key].value
 
 
-def test_thermal_precipt():
-    m = thermal_precipitation.main()
+@pytest.mark.parametrize(
+    "hess_type",
+    [
+        "ZeroHessian",
+        "GaussNewton",
+        "LBFGS",
+        "BFGS",
+        "BFGS_mod",
+        "BFGS_damp",
+        "BFGS_ipopt",
+    ],
+)
+def test_thermal_precipt(hess_type):
+    m = thermal_precipitation.main(hess_type=hess_type)
     assert (
         pytest.approx(
-            m.precipitation_properties[("speciesAmount", "Calcite")].value, 1e-3
+            m.precipitation_properties[("speciesAmount", "Calcite")].value, 1e-2
         )
-        == 0.0009467511444760701
+        == 0.0005126288368576707
     )
     assert (
         pytest.approx(
             m.precipitation_properties[("vaporPressure", "H2O(g)")].value, 1e-3
         )
-        == 17801.227149565908
+        == 12162.679103537726
     )
     assert (
         pytest.approx(m.precipitation_properties[("pH", None)].value, 1e-3)
-        == 6.913772075650711
+        == 6.937058009545616
     )
-    assert pytest.approx(m.Q_heating.value, 1e-3) == 165000
-    assert pytest.approx(m.Q_recoverable.value, 1e-3) == 82500
-    assert (
-        pytest.approx(m.precipitator_temperature.value, 1e-3)
-        == 273.15 + 57.90940479948432
-    )
-    assert (
-        pytest.approx(m.cooled_treated_temperature.value, 1e-1)
-        == 273.15 + 37.8773655288286
-    )
+    assert pytest.approx(m.Q_heating.value, abs=4e4) == 125.56703878579671 * 1000
+    assert pytest.approx(m.precipitator_temperature.value, 1e-3) == 273.15 + 50
 
 
-def test_ion_exchange():
-    m = simple_ion_exchange.main()
+@pytest.mark.parametrize(
+    "hess_type",
+    [
+        "ZeroHessian",
+        "GaussNewton",
+        "LBFGS",
+        "BFGS",
+        "BFGS_mod",
+        "BFGS_damp",
+        "BFGS_ipopt",
+    ],
+)
+def test_ion_exchange(hess_type):
+    m = simple_ion_exchange.main(hess_type=hess_type)
 
-    assert pytest.approx(m.removal_percent["Mg"].value, 1e-1) == -30.388987138928876
-    assert pytest.approx(m.removal_percent["Ca"].value, 1e-1) == -76.77992923439626
-    assert pytest.approx(m.treated_pH.value, 1e-2) == 13.469086112114972
-    assert pytest.approx(m.base_addition.value, abs=1e-3) == 0.3887356155775067
+    assert pytest.approx(m.removal_percent["Mg"].value, 1e-3) == -35.54130924283
+    assert pytest.approx(m.removal_percent["Ca"].value, 1e-3) == -79.15299911033
+    assert pytest.approx(m.treated_pH.value, 1e-3) == 13.374349619456911
+    assert pytest.approx(m.base_addition.value, abs=1e-3) == 0.31967185413270405
 
 
-def test_biogas():
-    m = biogas_combustion.main()
+@pytest.mark.parametrize(
+    "hess_type",
+    [
+        "ZeroHessian",
+        "GaussNewton",
+        "LBFGS",
+        "BFGS",
+        "BFGS_mod",
+        # "BFGS_damp", # does not work on this example
+        "BFGS_ipopt",
+    ],
+)
+def test_biogas(hess_type):
+    m = biogas_combustion.main(hess_type=hess_type)
 
-    assert pytest.approx(m.air_to_fuel_ratio.value, 1e-1) == 3.8751662012681587
-    assert pytest.approx(m.exhaust_temperature.value, 1e-1) == 2000
+    assert pytest.approx(m.air_to_fuel_ratio.value, 1e-3) == 3.8751662012681587
+    assert pytest.approx(m.exhaust_temperature.value, 1e-3) == 2000

@@ -9,35 +9,7 @@
 # information, respectively. These files are also available online at the URL
 # "https://github.com/watertap-org/reaktoro-pse/"
 #################################################################################
-from pyomo.environ import log10, log, exp
-from idaes.core.util.math import smooth_max
-
-
-def build_scaling_tendency_constraint(rkt_output_object):
-    user_output_var = rkt_output_object.pyomo_var
-    build_properties = rkt_output_object.pyomo_build_options.properties
-    return (
-        user_output_var
-        == 10
-        ** build_properties[
-            ("saturationIndex", rkt_output_object.property_index)
-        ].pyomo_var
-    )
-
-
-# log10(user_output_var) == smooth_max(
-#     build_properties[("saturationIndex", rkt_output_object.property_index)].pyomo_var,
-#     -5,
-# )
-
-
-def build_ph_constraint(rkt_output_object):
-    user_output_var = rkt_output_object.pyomo_var
-    build_properties = rkt_output_object.pyomo_build_options.properties
-    return (
-        -build_properties[("speciesActivityLn", "H+")].pyomo_var / log(10)
-        == user_output_var
-    )
+from pyomo.environ import log10, log, exp, units as pyunits
 
 
 def build_vapor_pressure_constraint(rkt_output_object):
@@ -50,6 +22,7 @@ def build_vapor_pressure_constraint(rkt_output_object):
             ].pyomo_var
         )
         * 101325
+        * pyunits.Pa
         == user_output_var
     )
 
@@ -101,7 +74,7 @@ def build_direct_scaling_tendency_constraint(rkt_output_object):
     user_output_var = rkt_output_object.pyomo_var
     build_properties = rkt_output_object.pyomo_build_options.properties
     build_options = rkt_output_object.pyomo_build_options.options
-    # TODO: Needs to add temperature unit verificaiton and pressure unit verification
+    # TODO: Needs to add temperature unit verification and pressure unit verification
     temperature_var = build_properties[("temperature", None)].pyomo_var
     if build_options["logk_type"] == "Analytical":
         A_params = build_options["logk_paramters"]
@@ -125,6 +98,7 @@ def build_direct_scaling_tendency_constraint(rkt_output_object):
             - vfparams["dHr"]
             / build_options["gas_constant"]
             * (1 / temperature_var - 1 / vfparams["Tr"])
+            / log(10)
         ]
     # pressure dependenance
     log_k.append(

@@ -11,21 +11,20 @@
 #################################################################################
 
 import multiprocessing
-from matplotlib.pyplot import sca
-from pytest import param
 from reaktoro_pse.core.reaktoro_gray_box import (
     ReaktoroGrayBox,
 )
 from reaktoro_pse.parallel_tools.parallel_manager import ReaktoroParallelManager
 
-from reaktoro_pse.core.reaktoro_gray_box import HessTypes
+from reaktoro_pse.core.util_classes.hessian_functions import HessTypes
 
 from pyomo.contrib.pynumero.interfaces.external_grey_box import (
     ExternalGreyBoxBlock,
 )
 import numpy as np
 from idaes.core.base.process_base import declare_process_block_class, ProcessBlockData
-from pyomo.common.config import ConfigValue, IsInstance, ConfigDict
+from pyomo.common.config import ConfigValue, IsInstance
+from reaktoro_pse.reaktoro_block_config.hessian_options import HessianOptions
 
 
 class ReaktoroBlockData:
@@ -40,11 +39,16 @@ class ReaktoroBlockData:
 
     def get_configs(self):
         configs = []
-        configs.append(self.state.export_config())
-        configs.append(self.inputs.export_config())
-        configs.append(self.outputs.export_config())
-        configs.append(self.jacobian.export_config())
-        configs.append(self.solver.export_config())
+        if self.state is not None:
+            configs.append(self.state.export_config())
+        if self.inputs is not None:
+            configs.append(self.inputs.export_config())
+        if self.outputs is not None:
+            configs.append(self.outputs.export_config())
+        if self.jacobian is not None:
+            configs.append(self.jacobian.export_config())
+        if self.solver is not None:
+            configs.append(self.solver.export_config())
         return configs
 
     def freeze_state(self):
@@ -61,12 +65,14 @@ class AggregateSolverState:
         self.outputs = []
         self.output_blk_indexes = []
         self.jacobian_scaling_obj = []
+        self.input_scaling_obj = []
         self.solver_functions = {}
         self.get_solution_function = {}
         self.output_matrix = []
         self.jacobian_matrix = []
         self.input_windows = {}
         self.output_windows = {}
+        self.relaxation_constraints = {}
         self.parallel_mode = parallel_mode
         if maximum_number_of_parallel_solves is None:
             maximum_number_of_parallel_solves = multiprocessing.cpu_count() - 1
@@ -87,11 +93,9 @@ class AggregateSolverState:
     def register_output(self, block_index, output_key):
         self.outputs.append((block_index, output_key))
         self.output_blk_indexes.append(block_index)
-
-        if len(self.output_blk_indexes) > 1:
-            self.jacobian_matrix = np.zeros((len(self.outputs), len(self.inputs)))
-            self.output_matrix = np.zeros(len(self.outputs))
-            self.get_windows(block_index)
+        self.jacobian_matrix = np.zeros((len(self.outputs), len(self.inputs)))
+        self.output_matrix = np.zeros(len(self.outputs))
+        self.get_windows(block_index)
 
     def get_windows(self, block_idx):
         _, output_unique_sets = np.unique(self.output_blk_indexes, return_inverse=True)
@@ -115,12 +119,22 @@ class AggregateSolverState:
             output_end + 1,
         )  # need to offset by 1
 
-    def register_scaling_vals(self, scaling_func):
+    def register_scaling_vals(self, scaling_func, input_scaling_func):
         self.jacobian_scaling_obj.append(scaling_func)
+        self.input_scaling_obj.append(input_scaling_func)
 
     def get_jacobian_scaling(self):
         scaling_array = None
         for obj in self.jacobian_scaling_obj:
+            if scaling_array is None:
+                scaling_array = obj()
+            else:
+                scaling_array = np.hstack((scaling_array, obj()))
+        return scaling_array
+
+    def get_input_scaling(self):
+        scaling_array = None
+        for obj in self.input_scaling_obj:
             if scaling_array is None:
                 scaling_array = obj()
             else:
@@ -169,7 +183,6 @@ class AggregateSolverState:
         for blk in active_workers:
             jacobian, output = self.get_solution_function[blk]()
             self.update_solution(blk, output, jacobian)
-
         return (
             self.jacobian_matrix,
             self.output_matrix,
@@ -203,16 +216,7 @@ class PseudoGrayBox:
 @declare_process_block_class("ReaktoroBlockManager")
 class ReaktoroBlockManagerData(ProcessBlockData):
     CONFIG = ProcessBlockData.CONFIG()
-    CONFIG.declare(
-        "hessian_type",
-        ConfigValue(
-            default="BFGS",
-            domain=IsInstance((str, HessTypes)),
-            description="Hessian type to use for reaktor gray box",
-            doc="""Hessian type to use, some might provide better stability
-                options (Jt.J, BFGS, BFGS-mod, BFGS-damp, BFGS-ipopt""",
-        ),
-    )
+    CONFIG.declare("hessian_options", HessianOptions().get_dict())
     CONFIG.declare(
         "use_parallel_mode",
         ConfigValue(
@@ -255,7 +259,17 @@ class ReaktoroBlockManagerData(ProcessBlockData):
                 self.config.worker_timeout,
             )
 
-    def register_block(self, state, inputs, outputs, jacobian, solver, builder):
+    def register_block(
+        self,
+        state=None,
+        inputs=None,
+        outputs=None,
+        jacobian=None,
+        solver=None,
+        builder=None,
+        speciation_block=None,
+        property_block=None,
+    ):
         blk = ReaktoroBlockData()
         blk.state = state
         blk.inputs = inputs
@@ -263,8 +277,31 @@ class ReaktoroBlockManagerData(ProcessBlockData):
         blk.jacobian = jacobian
         blk.solver = solver
         blk.builder = builder
-        blk.freeze_state()
 
+        if speciation_block is not None:
+            blk.frozen_state = {}
+
+            for i, spc_blk in enumerate(speciation_block):
+                setattr(blk, f"spc_blk_{i}", ReaktoroBlockData())
+                getattr(blk, f"spc_blk_{i}").state = spc_blk["state"]
+                getattr(blk, f"spc_blk_{i}").inputs = spc_blk["inputs"]
+                getattr(blk, f"spc_blk_{i}").outputs = spc_blk["outputs"]
+                getattr(blk, f"spc_blk_{i}").jacobian = spc_blk["jacobian"]
+                getattr(blk, f"spc_blk_{i}").solver = spc_blk["solver"]
+                getattr(blk, f"spc_blk_{i}").freeze_state()
+                blk.frozen_state[f"spc_blk_{i}"] = getattr(
+                    blk, f"spc_blk_{i}"
+                ).get_configs()
+        else:
+            blk.freeze_state()
+        if property_block is not None:
+            blk.property_block = ReaktoroBlockData()
+            blk.property_block.state = property_block["state"]
+            blk.property_block.inputs = property_block["inputs"]
+            blk.property_block.outputs = property_block["outputs"]
+            blk.property_block.jacobian = property_block["jacobian"]
+            blk.property_block.solver = property_block["solver"]
+            blk.frozen_state["property_block"] = blk.property_block.get_configs()
         self.registered_blocks.append(blk)
         return blk
 
@@ -272,7 +309,8 @@ class ReaktoroBlockManagerData(ProcessBlockData):
         for block_idx, block in enumerate(self.registered_blocks):
             if self.config.use_parallel_mode:
                 self.parallel_manager.register_block(block_idx, block)
-            for key, obj in block.inputs.rkt_inputs.items():
+            for key in block.inputs.rkt_inputs.rkt_input_list:
+                obj = block.inputs.rkt_inputs[key]
                 self.aggregate_solver_state.register_input(block_idx, key, obj)
             for output in block.outputs.rkt_outputs.keys():
                 self.aggregate_solver_state.register_output(block_idx, output)
@@ -284,7 +322,7 @@ class ReaktoroBlockManagerData(ProcessBlockData):
                     block_idx, solve_func
                 )
                 self.aggregate_solver_state.register_scaling_vals(
-                    block.builder.get_jacobian_scaling
+                    block.builder.get_jacobian_scaling, block.builder.get_input_scaling
                 )
                 self.aggregate_solver_state.register_get_function(block_idx, get_func)
             else:
@@ -302,7 +340,13 @@ class ReaktoroBlockManagerData(ProcessBlockData):
             inputs=self.aggregate_solver_state.inputs,
             input_dict=self.aggregate_solver_state.input_dict,
             outputs=self.aggregate_solver_state.outputs,
-            hessian_type=self.config.hessian_type,
+            hessian_type=self.config.hessian_options.hessian_type,
+            bfgs_initialization_type=self.config.hessian_options.bfgs_initialization_type,
+            bfgs_init_min_hessian_value=self.config.hessian_options.bfgs_init_min_hessian_value,
+            bfgs_init_max_hessian_value=self.config.hessian_options.bfgs_init_max_hessian_value,
+            bfgs_init_const_hessian_value=self.config.hessian_options.bfgs_init_const_hessian_value,
+            bfgs_hessian_memory=self.config.hessian_options.bfgs_hessian_memory,
+            bfgs_epsilon=self.config.hessian_options.bfgs_epsilon,
         )
         self.reaktoro_model = ExternalGreyBoxBlock(external_model=external_model)
         for block_idx, block in enumerate(self.registered_blocks):
@@ -320,6 +364,7 @@ class ReaktoroBlockManagerData(ProcessBlockData):
             if self.config.use_parallel_mode:
                 init_func = self.parallel_manager.get_initialize_function(block_idx)
                 disp_func = self.parallel_manager.get_display_function(block_idx)
+                jac_func = self.parallel_manager.get_jacobian_matrix_function(block_idx)
             else:
                 init_func = self.aggregate_solver_state.solver_functions[block_idx]
                 disp_func = None
@@ -327,6 +372,7 @@ class ReaktoroBlockManagerData(ProcessBlockData):
                 gray_box_model=pseudo_gray_box_model,
                 reaktoro_initialize_function=init_func,
                 display_reaktoro_state_function=disp_func,
+                get_jacobian_matrix_function=jac_func,
             )
             block.pseudo_gray_box = pseudo_gray_box_model
 

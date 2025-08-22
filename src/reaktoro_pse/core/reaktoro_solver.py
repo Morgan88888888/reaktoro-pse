@@ -9,7 +9,6 @@
 # information, respectively. These files are also available online at the URL
 # "https://github.com/watertap-org/reaktoro-pse/"
 #################################################################################
-from matplotlib.table import Cell
 import reaktoro as rkt
 
 import numpy as np
@@ -75,8 +74,8 @@ class ReaktoroSolver:
         existing_constraints = self.input_specs.equilibrium_specs.namesConstraints()
 
         existing_variables = self.input_specs.equilibrium_specs.namesControlVariables()
-        _log.debug(f"rktSolver inputs: {existing_variables}")
-        _log.debug(f"rktSolver constraints: {existing_constraints}")
+        _log.info(f"rktSolver inputs: {existing_variables}")
+        _log.info(f"rktSolver constraints: {existing_constraints}")
         self.solver = rkt.EquilibriumSolver(self.input_specs.equilibrium_specs)
         self.conditions = rkt.EquilibriumConditions(self.input_specs.equilibrium_specs)
 
@@ -88,6 +87,7 @@ class ReaktoroSolver:
         self._sequential_fails = 0
         self._max_fails = maximum_failed_solves
         self._input_params = {}
+        self._old_input_params = {}
         self.jacobian_scaling_values = None
 
     def export_config(self):
@@ -102,6 +102,12 @@ class ReaktoroSolver:
         export_object.max_iters = self.solver_options.optima.maxiters
         export_object.presolve_max_iters = self.presolve_options.optima.maxiters
         export_object.hessian_type = self.hessian_type
+        export_object.bfgs_initialization_type = self.bfgs_initialization_type
+        export_object.bfgs_init_min_hessian_value = self.bfgs_init_min_hessian_value
+        export_object.bfgs_init_max_hessian_value = self.bfgs_init_max_hessian_value
+        export_object.bfgs_init_const_hessian_value = self.bfgs_init_const_hessian_value
+        export_object.bfgs_hessian_memory = self.bfgs_hessian_memory
+        export_object.bfgs_epsilon = self.bfgs_epsilon
         export_object.block_name = self.block_name
         return export_object
 
@@ -116,7 +122,19 @@ class ReaktoroSolver:
             export_object.max_iters,
             export_object.presolve_max_iters,
             export_object.hessian_type,
+            export_object.bfgs_initialization_type,
+            export_object.bfgs_init_min_hessian_value,
+            export_object.bfgs_init_max_hessian_value,
+            export_object.bfgs_init_const_hessian_value,
+            export_object.bfgs_hessian_memory,
+            export_object.bfgs_epsilon,
         )
+
+    def equilibrate_state(self):
+        self.state.equilibrate_state()
+
+    def display_state(self):
+        print(self.state.state)
 
     def set_solver_options(
         self,
@@ -127,7 +145,13 @@ class ReaktoroSolver:
         presolve_epsilon=1e-12,
         max_iters=500,
         presolve_max_iters=500,
-        hessian_type="J.tJ",
+        hessian_type="ZeroHessian",
+        bfgs_initialization_type="scalar1",
+        bfgs_init_min_hessian_value=1e-32,
+        bfgs_init_max_hessian_value=1e8,
+        bfgs_init_const_hessian_value=1e-16,
+        bfgs_hessian_memory=3,
+        bfgs_epsilon=1e-12,
     ):
         """configuration for reaktro solver
 
@@ -141,13 +165,18 @@ class ReaktoroSolver:
         self.solver_options.epsilon = epsilon
         self.solver_options.optima.maxiters = max_iters
         self.solver_options.optima.convergence.tolerance = tolerance
-
         self.presolve_options.epsilon = presolve_epsilon
         self.presolve_options.optima.maxiters = presolve_max_iters
         self.presolve_options.optima.convergence.tolerance = presolve_tolerance
         self.presolve = presolve
         self.solver.setOptions(self.solver_options)
         self.hessian_type = hessian_type
+        self.bfgs_initialization_type = bfgs_initialization_type
+        self.bfgs_init_min_hessian_value = bfgs_init_min_hessian_value
+        self.bfgs_init_max_hessian_value = bfgs_init_max_hessian_value
+        self.bfgs_init_const_hessian_value = bfgs_init_const_hessian_value
+        self.bfgs_hessian_memory = bfgs_hessian_memory
+        self.bfgs_epsilon = bfgs_epsilon
         if self.input_specs.assert_charge_neutrality:
             self.conditions.charge(0)
 
@@ -168,16 +197,19 @@ class ReaktoroSolver:
         else:
             getattr(self.conditions, custom_bound)(index, value)
 
-    def update_specs(self, params):
+    def update_specs(self, params, use_temp):
         for input_key in self.input_specs.rkt_inputs.rkt_input_list:
             input_obj = self.input_specs.rkt_inputs[input_key]
-            if params is None:
-                value = input_obj.get_value(update_temp=True, apply_conversion=True)
-
+            if params is None and use_temp is False:
+                value = input_obj.get_value(
+                    update_temp=True,
+                    apply_conversion=True,
+                )
+            elif use_temp:
+                value = input_obj.get_temp_value()
             else:
                 value = params.get(input_key)
                 input_obj.set_temp_value(value)
-
             unit = input_obj.main_unit
             self._input_params[input_key] = value
             if input_key == RktInputTypes.temperature:
@@ -193,9 +225,8 @@ class ReaktoroSolver:
     def get_outputs(self):
         output_arr = []
         for key, obj in self.output_specs.rkt_outputs.items():
-            output_arr.append(
-                self.output_specs.evaluate_property(obj, update_values_in_object=True)
-            )
+            val = self.output_specs.evaluate_property(obj, update_values_in_object=True)
+            output_arr.append(val)
         return output_arr
 
     def get_jacobian(self):
@@ -214,17 +245,20 @@ class ReaktoroSolver:
     def solve_reaktoro_block(
         self,
         params=None,
+        use_temp=False,
         display=False,
         presolve=False,
     ):
         # here we solve reaktor model and return the jacobian matrix and solution, as
         # Cell as update relevant reaktoroSpecs
-        self.update_specs(params)
+        self.update_specs(params, use_temp)
         solve_failed = False
         try:
+
             result = self.try_solve(presolve)
             self.outputs = self.get_outputs()
             self.jacobian_matrix = self.get_jacobian()
+
         except RuntimeError:
             solve_failed = True
         if solve_failed or result.succeeded() == False or display:
@@ -233,7 +267,9 @@ class ReaktoroSolver:
             )
             _log.warning("----inputs were -----")
             for key, value in self._input_params.items():
-                _log.warning(f"{key}: {value}")
+                _log.warning(
+                    f"{key}: {value}, prior input was: {self._old_input_params.get(key,None)}, delta: {value - self._old_input_params.get(key,0)}"
+                )
             self._sequential_fails += 1
             if self._sequential_fails > self._max_fails:
                 raise RuntimeError(
@@ -262,7 +298,13 @@ class ReaktoroSolver:
             self.conditions,
         )
         self.output_specs.update_supported_props()
+        if result.succeeded():
+            for input_key, value in self._input_params.items():
+                self._old_input_params[input_key] = value
         return result
 
     def get_jacobian_scaling(self):
-        return self.jacobian_scaling_values
+        raise NotImplementedError("This method gets updated by ReaktoroBlockBuilder")
+
+    def get_input_scaling(self):
+        raise NotImplementedError("This method gets updated by ReaktoroBlockBuilder")

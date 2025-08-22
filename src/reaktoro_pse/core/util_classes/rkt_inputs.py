@@ -9,9 +9,8 @@
 # information, respectively. These files are also available online at the URL
 # "https://github.com/watertap-org/reaktoro-pse/"
 #################################################################################
-from pyomo.environ import Var, value, units as pyunits
+from pyomo.environ import value, units as pyunits
 from pyomo.core.base.var import VarData
-
 
 __author__ = "Alexander V. Dudchenko"
 
@@ -23,9 +22,14 @@ class RktInputTypes:
     K = "K"
     Pa = "Pa"
     pH = "pH"
+    pOH = "pOH"
     temperature = "temperature"
     enthalpy = "enthalpy"
     pressure = "pressure"
+    species = "species"
+    element = "element"
+    specie = "specie"
+    chemical_specie = "chemical_specie"
     dimensionless = "dimensionless"
     mass_units = ["kg", "mg"]
     system_state = "system_state"
@@ -37,6 +41,8 @@ class RktInputTypes:
     liquid_phase = "liquid_phase"
     solid_phase = "solid_phase"
     condensed_phase = "condensed_phase"
+    relaxation = "relaxation"
+
     supported_phases = [
         aqueous_phase,
         gas_phase,
@@ -46,14 +52,33 @@ class RktInputTypes:
         condensed_phase,
         liquid_phase,
     ]
-    non_species_types = [pH, enthalpy, pressure, temperature]
+    non_species_types = [pH, enthalpy, pressure, temperature, relaxation, pOH]
+
+
+# imitator for pyomo object, passed as input to speciation block
+class DummyPyomoVar:
+    def __init__(self):
+        self.value = 1
+        self.main_unit = RktInputTypes.dimensionless  # default unit
+        self.original_key = None  # used to track original key in rkt inputs
+
+    def value(self):
+        return self.value
+
+    def set_value(self, value):
+        self.value = value
+
+    def get_value(self):
+        return self.value
 
 
 class RktInput:
     def __init__(self, var_name, pyomo_var=None):
         # TODO: Add more flexible check that user providd a pyomo variable or param
         self.var_name = var_name
-        self.temp_value = 0  # used during reaktoro solver or temporarty holding a value
+        self.temp_value = (
+            None  # used during reaktoro solver or temporarty holding a value
+        )
 
         self.rkt_index = None  # tracking rkt input index
         self.jacobian_index = None  # tracking rkt jacobian row index
@@ -65,19 +90,32 @@ class RktInput:
         self.required_unit = None
         self.rkt_name = var_name
         self.lower_bound = None
+        self.upper_bound = None
         self.input_type = None
+        self.io_type = None  # input or output
+        self.dummy_var = None
+        self.dummy_var_key = None
         if pyomo_var is not None:
-            if isinstance(pyomo_var, (Var, VarData)) == False:
+            if isinstance(pyomo_var, DummyPyomoVar):
+                # if its a dummy variable, we do not need to set it
+                self.pyomo_var = None
+                self.dummy_var = pyomo_var
+                self.value = self.dummy_var.value
+                self.dummy_var_key = self.dummy_var.original_key
+            elif isinstance(pyomo_var, VarData):
+                self.value = pyomo_var.value
+                self.pyomo_var = pyomo_var
+            else:
                 raise TypeError(
                     "{var_name} is not a pyomo variable, ensure its pyomo variable"
                 )
-            self.value = pyomo_var.value
-            self.pyomo_var = pyomo_var
             self.check_unit()
         else:
             self.pyomo_var = None
+            self.value = None
 
     def delete_pyomo_var(self):
+
         self.update_values(True)
         del self.pyomo_var
         self.pyomo_var = None
@@ -90,18 +128,27 @@ class RktInput:
 
     def update_values(self, update_temp=False):
         if self.pyomo_var is not None:
+
             self.value = self.pyomo_var.value
             if self.conversion_value is not None:
                 self.converted_value = value(self.get_pyomo_with_required_units())
+
             else:
                 self.converted_value = self.value
+
+        if self.dummy_var is not None:
+            self.value = self.dummy_var.get_value()
         if update_temp:
             self.set_temp_value(self.value)
 
     def set_temp_value(self, value):
+        if self.dummy_var is not None:
+            self.dummy_var.set_value(value)
         self.temp_value = value
 
     def get_temp_value(self):
+        if self.dummy_var is not None:
+            return self.dummy_var.get_value()
         return self.temp_value
 
     def get_lower_bound(self):
@@ -110,17 +157,26 @@ class RktInput:
     def set_lower_bound(self, value):
         self.lower_bound = value
 
+    def get_upper_bound(self):
+        return self.upper_bound
+
+    def set_upper_bound(self, value):
+        self.upper_bound = value
+
     def get_value(self, update_temp=False, apply_conversion=False):
         self.update_values(update_temp)
-        if apply_conversion:
-            return self.converted_value
+        if apply_conversion and self.conversion_value is not None:
+            _value = self.converted_value
         else:
-            return self.value
+            _value = self.value
+
+        return _value
 
     def get_pyomo_with_required_units(self):
         if self.conversion_value == None:
             return self.pyomo_var
         else:
+
             return pyunits.convert(
                 self.pyomo_var / (self.conversion_value * self.conversion_unit),
                 to_units=self.required_unit,
@@ -181,20 +237,29 @@ class RktInput:
         reaktoro is "batch" and has no flow, so here we will isolate
         the primary mass unit from time unit and
         also convert them to string"""
-        default_unit = str(pyunits.get_units(self.pyomo_var))
+        if self.pyomo_var is not None:
+            default_unit = str(pyunits.get_units(self.pyomo_var))
+
+        elif self.dummy_var is not None:
+            default_unit = self.dummy_var.main_unit
+        else:
+            raise TypeError(
+                f"RktInput {self.var_name} does not have a pyomo variable or dummy variable"
+            )
         if (
             default_unit == RktInputTypes.dimensionless
             and self.var_name not in RktInputTypes.non_species_types
         ):
             self.main_unit = RktInputTypes.mol
             self.time_unit = None
-        split_units = default_unit.split("/")
-        if len(split_units) == 2:
-            self.time_unit = split_units[1]
-            self.main_unit = split_units[0]
         else:
-            self.time_unit = None
-            self.main_unit = default_unit
+            split_units = default_unit.split("/")
+            if len(split_units) == 2:
+                self.time_unit = split_units[1]
+                self.main_unit = split_units[0]
+            else:
+                self.time_unit = None
+                self.main_unit = default_unit
 
 
 class RktInputs(dict):
@@ -245,6 +310,7 @@ class RktInputs(dict):
     def convert_rkt_species_fun(self, var_name, phase):
         if self.conversion_method[phase] == "default":
             var_name = specie_to_rkt_species(var_name)
+
         elif isinstance(self.conversion_method[phase], dict):
             var_name = self.conversion_method[phase][var_name]
         else:
@@ -254,7 +320,10 @@ class RktInputs(dict):
         return var_name
 
     def _set_species(self, var_name, var, phase):
-        if var_name not in RktInputTypes.non_species_types:
+        if (
+            var_name not in RktInputTypes.non_species_types
+            and phase not in RktInputTypes.non_species_types
+        ):
             if var_name not in self.species_list[phase]:
                 if self.convert_to_rkt_species[phase]:
                     var_name = self.convert_rkt_species_fun(var_name, phase)
@@ -282,17 +351,31 @@ def specie_to_rkt_species(species):
 
     # TODO: needs to be better automated
     name_dict = {
-        "-2": ["SO4", "CO3"],
+        "-2": [
+            "SO4",
+            "CO3",
+        ],
         "-": ["Cl", "HCO3", "F", "NO3"],
         "+": ["Na", "K"],
-        "+2": ["Mg", "Mn", "Ca", "Sr", "Ba"],
+        "+2": ["Mg", "Mn", "Ca", "Sr", "Ba", "Fe"],
         "": ["H2O", "CO2"],
         "H4SiO4": ["Si", "SiO2"],
         "SeO4-2": ["Se"],
     }
+
+    def remove_charge_int(specie):
+        split_chars = ["_", "-", "+"]
+        char_present = [char in specie for char in split_chars]
+        if any(char_present):
+            for i, char in enumerate(char_present):
+                if char:
+                    specie = specie.split(split_chars[i])
+                    return specie[0]
+        return specie
+
     for charge, species_list in name_dict.items():
         for spc in species_list:
-            if spc in species:
+            if spc == remove_charge_int(species):
                 if charge == "H4SiO4":
                     return charge
                 if charge == "SeO4-2":

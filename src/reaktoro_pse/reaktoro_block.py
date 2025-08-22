@@ -12,11 +12,11 @@
 
 from idaes.core.base.process_base import declare_process_block_class, ProcessBlockData
 import idaes.logger as idaeslog
-
+import math
 
 from pyomo.common.config import ConfigValue, IsInstance
 from pyomo.core.base.var import IndexedVar
-from pyomo.environ import Block, Constraint
+from pyomo.environ import Block, Constraint, Var, units as pyunits
 
 from reaktoro_pse.core.reaktoro_state import ReaktoroState
 from reaktoro_pse.core.reaktoro_inputs import (
@@ -27,14 +27,15 @@ from reaktoro_pse.core.util_classes.rkt_inputs import RktInputTypes
 from reaktoro_pse.core.reaktoro_outputs import (
     ReaktoroOutputSpec,
 )
-
+from types import SimpleNamespace
 from reaktoro_pse.core.reaktoro_jacobian import ReaktoroJacobianSpec
 from reaktoro_pse.core.reaktoro_solver import ReaktoroSolver
 from reaktoro_pse.core.reaktoro_block_builder import ReaktoroBlockBuilder
-
+from reaktoro_pse.core.reaktoro_coupled_solver import ReaktoroCoupledSolver
 from reaktoro_pse.parallel_tools.reaktoro_block_manager import ReaktoroBlockManager
 
 from reaktoro_pse.reaktoro_block_config.jacobian_options import JacobianOptions
+from reaktoro_pse.reaktoro_block_config.hessian_options import HessianOptions
 from reaktoro_pse.reaktoro_block_config.reaktoro_solver_options import (
     ReaktoroSolverOptions,
 )
@@ -127,6 +128,36 @@ class ReaktoroBlockData(ProcessBlockData):
         ),
     )
     CONFIG.declare(
+        "direct_speciation_to_property_block_coupling",
+        ConfigValue(
+            default=True,
+            domain=bool,
+            description="This mode will directly couple speciation block to property block",
+            doc="""
+            - If True this will build a single graybox model that contains both the speciation and property blocks, the true species from speciation block will
+            be directly pass the property block, and chain rule will be used to compute the jacobian.
+            - If False, this will build two separate graybox models, one for speciation and one for property block, the true species from speciation block
+            will be passed to property block through pyomo constraints. This mode is less stable as property block can fail to due to solver taking steps that result
+            in infeasible true species composition.
+            """,
+        ),
+    )
+    CONFIG.declare(
+        "build_graybox_model",
+        ConfigValue(
+            default=True,
+            domain=bool,
+            description="This will build a graybox model",
+            doc="""
+            Use this option to disable building graybox models and generate a number of configured speciation blocks that can be passed
+            together into a single property block in direct coupling mode. These configured Reaktoro model blocks can be passed into another ReaktoroBlock through
+            'external_speciation_reaktoro_blocks' option.
+            Use this to perform mixing operations, (e.g. speciate multiple streams and then mix them together in a single property block).
+            """,
+        ),
+    )
+
+    CONFIG.declare(
         "exclude_species_list",
         ConfigValue(
             default=None,
@@ -206,6 +237,7 @@ class ReaktoroBlockData(ProcessBlockData):
             using pyomo constraints (Set to False) or reaktoro (Set to True).""",
         ),
     )
+
     CONFIG.declare(
         "assert_charge_neutrality",
         ConfigValue(
@@ -226,15 +258,17 @@ class ReaktoroBlockData(ProcessBlockData):
         ),
     )
     CONFIG.declare(
-        "assert_charge_neutrality_on_all_blocks",
+        "assert_charge_neutrality_on_property_block",
         ConfigValue(
             default=True,
             domain=bool,
-            description="Defines if charge neutrality should be applied to property_block when build_speciation_block=True",
+            description="Defines if charge neutrality should be applied to property_block when build_speciation_block=True or when exact speciation is set to True",
             doc="""
             When user provides chemical inputs, its assumed that user wants to modify an equilibrated state, 
             as such a speciation and property block will be built. The speciation block will likely require charge balancing on ion basis (e.g Cl),
-            while property block that received exact speciation will balance on pH, to disable charge balance on property block set this option to False""",
+            while property block that received exact speciation do not necessarily need charge balance, 
+            If this is set to True the property block will charge balance on pH
+            """,
         ),
     )
 
@@ -303,9 +337,19 @@ class ReaktoroBlockData(ProcessBlockData):
             before doing any initialization calls, or interacting with ReaktoroBlocks themself .""",
         ),
     )
-
+    CONFIG.declare(
+        "external_speciation_reaktoro_blocks",
+        ConfigValue(
+            default=None,
+            domain=IsInstance(list),
+            description="Provides a list of external reaktoro blocks for speciation",
+            doc="""
+            Used to for mixing different speciation blocks when useing "species_direct" options
+            Build external reaktoro block and then pass them into this option. .""",
+        ),
+    )
     CONFIG.declare("jacobian_options", JacobianOptions().get_dict())
-
+    CONFIG.declare("hessian_options", HessianOptions().get_dict())
     CONFIG.declare(
         "reaktoro_solve_options",
         ReaktoroSolverOptions().get_dict(advanced_options=True),
@@ -318,16 +362,39 @@ class ReaktoroBlockData(ProcessBlockData):
     def build(self):
         super().build()
         # configure state
+        self.direct_coupling_mode = False
+        self.external_block_mode = False
         if self.config.build_speciation_block:
             # create speciation block and then property block
-            self.speciation_block = Block()
+            if self.config.direct_speciation_to_property_block_coupling:
+                self.direct_coupling_mode = True
+                self.speciation_block = SimpleNamespace()
+            else:
+                self.speciation_block = Block()
             self.build_rkt_state(self.speciation_block, speciation_block=True)
             self.build_rkt_inputs(self.speciation_block, speciation_block=True)
             self.build_rkt_outputs(self.speciation_block, speciation_block=True)
             self.build_rkt_jacobian(self.speciation_block)
             self.build_rkt_solver(self.speciation_block, speciation_block=True)
-            self.build_gray_box(self.speciation_block)
 
+            self.build_gray_box(self.speciation_block, speciation_block=True)
+
+            self.build_rkt_state(
+                self,
+                speciation_block=False,
+                speciation_block_built=True,
+            )
+            self.build_rkt_inputs(
+                self, speciation_block=False, speciation_block_built=True
+            )
+        elif (
+            self.config.build_speciation_block == False
+            and self.config.external_speciation_reaktoro_blocks is not None
+        ):
+            self.external_block_mode = True
+            self.direct_coupling_mode = True
+            self.speciation_block = SimpleNamespace()
+            self.build_gray_box(self.speciation_block, speciation_block=True)
             self.build_rkt_state(
                 self,
                 speciation_block=False,
@@ -340,11 +407,18 @@ class ReaktoroBlockData(ProcessBlockData):
             # create property block only
             self.build_rkt_state(self)
             self.build_rkt_inputs(self)
-
+        if (
+            self.config.external_speciation_reaktoro_blocks is not None
+            and self.direct_coupling_mode == False
+        ):
+            raise TypeError(
+                "Provide external_speciation_reaktoro_blocks only when using 'species_direct' option"
+            )
         self.build_rkt_outputs(self)
         self.build_rkt_jacobian(self)
         self.build_rkt_solver(self)
-        self.build_gray_box(self)
+        if self.config.build_graybox_model:
+            self.build_gray_box(self)
 
     def build_rkt_state(
         self,
@@ -401,7 +475,10 @@ class ReaktoroBlockData(ProcessBlockData):
                 return input_option
 
         def return_empty_dict_option(input_option):
-            if building_prop_block_after_speciation():
+            if (
+                building_prop_block_after_speciation()
+                and self.external_block_mode == False
+            ):
                 return {}
             else:
                 return input_option
@@ -430,16 +507,20 @@ class ReaktoroBlockData(ProcessBlockData):
             dbtype=self.config.database, database=self.config.database_file
         )
 
-        # setup input for different phaseoptions
+        # setup input for different phase options
         for phase in RktInputTypes.supported_phases:
             options = getattr(self.config, phase)
+            if building_prop_block_after_speciation():
+                composition_is_elements = False
+            else:
+                composition_is_elements = options.composition_is_elements
             block.rkt_state.set_input_options(
                 phase,
                 convert_to_rkt_species=return_false_option(
                     options.convert_to_rkt_species
                 ),
                 species_to_rkt_species_dict=options.species_to_rkt_species_dict,
-                composition_is_elements=options.composition_is_elements,
+                composition_is_elements=composition_is_elements,
             )
 
         # setup system inputs
@@ -456,15 +537,19 @@ class ReaktoroBlockData(ProcessBlockData):
                 self.config.system_state, self.config.system_state_modifier, "enthalpy"
             )
             pH_state = self.config.system_state
-            # get_prop_state(
-            #     self.config.system_state, self.config.system_state_modifier, "pH"
-            # )
         else:
             # use initial state
             temperature_state = self.config.system_state
             pressure_state = self.config.system_state
             enthalpy_state = self.config.system_state
             pH_state = self.config.system_state
+        config_ph = return_none_option(pH_state.pH)
+        config_ph_index = get_indexing(pH_state.pH_indexed)
+
+        # setup aqueous inputs
+        aqueous_input_composition = self.config.aqueous_phase.composition
+        liquid_input_composition = self.config.liquid_phase.composition
+        condensed_input_composition = self.config.condensed_phase.composition
 
         block.rkt_state.register_system_inputs(
             temperature=temperature_state.temperature,
@@ -473,25 +558,23 @@ class ReaktoroBlockData(ProcessBlockData):
             enthalpy_index=get_indexing(enthalpy_state.enthalpy_indexed),
             temperature_index=get_indexing(temperature_state.temperature_indexed),
             pressure_index=get_indexing(pressure_state.pressure_indexed),
-            pH=return_none_option(pH_state.pH),
-            pH_index=get_indexing(pH_state.pH_indexed),
+            pH=config_ph,
+            pH_index=config_ph_index,
         )
-        # setup aqueous inputs
-        aqueous_input_composition = self.config.aqueous_phase.composition
-        liquid_input_composition = self.config.liquid_phase.composition
-        condensed_input_composition = self.config.condensed_phase.composition
+
         if building_prop_block_after_speciation():
             # we need to ensure when we provide initial input compo into
             # speciation block we don't have extremely high ion concentration
             # these value swill be overwritten during initialization anyway
+
             for ion, obj in self.speciation_block.outputs.items():
                 if self.config.aqueous_phase.fixed_solvent_specie in ion:
                     obj.set_value(obj.value * 10)
                 else:
                     obj.set_value(obj.value / 1000)
+
             if aqueous_input_composition is not {}:
                 aqueous_input_composition = self.speciation_block.outputs
-
                 liquid_input_composition = {}
                 condensed_input_composition = {}
             elif liquid_input_composition is not {}:
@@ -507,9 +590,9 @@ class ReaktoroBlockData(ProcessBlockData):
                     "Speciation block requires that either liquid or aqueous phase is provided"
                 )
         else:
+            self.speciation_input_scale = False
             aqueous_input_composition = self.config.aqueous_phase.composition
         block.rkt_state.register_species_to_exclude(self.config.exclude_species_list)
-
         block.rkt_state.register_aqueous_inputs(
             composition=aqueous_input_composition,
             composition_index=get_indexing(
@@ -519,7 +602,7 @@ class ReaktoroBlockData(ProcessBlockData):
         block.rkt_state.register_liquid_inputs(
             composition=liquid_input_composition,
             composition_index=get_indexing(
-                self.config.aqueous_phase.composition_indexed, speciation_block_built
+                self.config.liquid_phase.composition_indexed, speciation_block_built
             ),
         )
         block.rkt_state.register_condensed_inputs(
@@ -619,7 +702,8 @@ class ReaktoroBlockData(ProcessBlockData):
             )
             if self.config.chemistry_modifier is not None:
                 block.rkt_inputs.register_chemistry_modifiers(
-                    self.config.chemistry_modifier, index=chemistry_modifier_indexed
+                    self.config.chemistry_modifier,
+                    index=chemistry_modifier_indexed,
                 )
             block.rkt_inputs.register_open_species(
                 self.config.reaktoro_solve_options.open_species_on_property_block
@@ -639,45 +723,32 @@ class ReaktoroBlockData(ProcessBlockData):
         block.rkt_inputs.register_free_elements(self.config.aqueous_phase.free_element)
         block.rkt_inputs.register_free_elements(self.config.liquid_phase.free_element)
         # register charge neutrality
-        # only ensure charge neutrality when doing first calculation
-        if speciation_block_built == False:
-            # if exact speciation - then charge balance should be done on pH
-            assert_charge_neutrality = self.config.assert_charge_neutrality
-            if self.config.exact_speciation == True:
-                # only do so if we have 'H+' in species
-                ion_for_balancing = "pH"
-                if "H+" not in block.rkt_state.database_species:
-                    assert_charge_neutrality = False
+        # default charge balance is for non exact speciation on property block
+        # if this is not speciation block and we are not given exact speciation
+        # the charge balance on user defined ion
+        exact_speciation = self.config.exact_speciation
+        assert_charge_neutrality = self.config.assert_charge_neutrality
+        ion_for_balancing = self.config.charge_neutrality_ion
 
-            else:
-                assert_charge_neutrality = self.config.assert_charge_neutrality
-                ion_for_balancing = self.config.charge_neutrality_ion
-
-            block.rkt_inputs.register_charge_neutrality(
-                assert_neutrality=assert_charge_neutrality,
-                ion=ion_for_balancing,
-            )
-            block.rkt_inputs.configure_specs(
-                dissolve_species_in_rkt=self.config.dissolve_species_in_reaktoro,
-                exact_speciation=self.config.exact_speciation,
-            )
-        else:
-            # if we have built a speciation block, the feed should be charge neutral and
-            # exact speciation is provided, then we balance on pH only,
-            # user can disable this by setting self.assert_charge_neutrality_on_all_blocks to False
-            assert_charge_neutrality = False
-            if self.config.assert_charge_neutrality_on_all_blocks:
-                # only do so if we have 'H+' in species
-                if "H+" in block.rkt_state.database_species:
-                    assert_charge_neutrality = self.config.assert_charge_neutrality
-            block.rkt_inputs.register_charge_neutrality(
-                assert_neutrality=assert_charge_neutrality,
-                ion="pH",
-            )
-            block.rkt_inputs.configure_specs(
-                dissolve_species_in_rkt=self.config.dissolve_species_in_reaktoro,
-                exact_speciation=True,
-            )
+        # if this is not speciation block and we are given exact speciation
+        # we charge balance on pH
+        if speciation_block == False and (exact_speciation or speciation_block_built):
+            # only do so if we have 'H+' in species
+            ion_for_balancing = "pH"
+            if (
+                "H+" not in block.rkt_state.database_species
+                or self.config.assert_charge_neutrality_on_property_block == False
+            ):
+                assert_charge_neutrality = False
+            exact_speciation = True
+        block.rkt_inputs.register_charge_neutrality(
+            assert_neutrality=assert_charge_neutrality,
+            ion=ion_for_balancing,
+        )
+        block.rkt_inputs.configure_specs(
+            dissolve_species_in_rkt=self.config.dissolve_species_in_reaktoro,
+            exact_speciation=exact_speciation,
+        )
         block.rkt_inputs.build_input_specs()
 
     def build_rkt_outputs(self, block, speciation_block=False):
@@ -694,19 +765,19 @@ class ReaktoroBlockData(ProcessBlockData):
         index = self.index()
 
         block.rkt_outputs = ReaktoroOutputSpec(block.rkt_state)
+
         if self.config.outputs is None:
             raise ValueError("Outputs must be provided!")
         if speciation_block:
             # when speciating we only want species amounts as output
-            if self.config.speciation_block_exclude_species is not None:
-                block.rkt_outputs.register_output(
-                    "speciesAmount",
-                    get_all_indexes=True,
-                    ignore_indexes=self.config.speciation_block_exclude_species,
-                )
-            else:
-                block.rkt_outputs.register_output("speciesAmount", get_all_indexes=True)
+            block.rkt_outputs.register_output(
+                "speciesAmount",
+                get_all_indexes=True,
+                ignore_indexes=self.config.speciation_block_exclude_species,
+            )
+
         else:
+
             # build user requested outputs
             for output_key, output_var in self.config.outputs.items():
                 if index is None or index in output_key:
@@ -718,8 +789,19 @@ class ReaktoroBlockData(ProcessBlockData):
                     else:
                         output_prop = None
                     if isinstance(output_var, bool):
+                        if (
+                            self.config.exact_speciation == False
+                            and output_key == "speciesAmount"
+                        ):
+                            ignore_species = (
+                                self.config.speciation_block_exclude_species
+                            )
+                        else:
+                            ignore_species = None
                         block.rkt_outputs.register_output(
-                            output_key, get_all_indexes=True
+                            output_key,
+                            get_all_indexes=True,
+                            ignore_indexes=ignore_species,
                         )
                     elif isinstance(output_var, list):
                         block.rkt_outputs.register_output(
@@ -731,6 +813,13 @@ class ReaktoroBlockData(ProcessBlockData):
                         block.rkt_outputs.register_output(
                             output_key, output_prop, pyomo_var=output_var
                         )
+
+    def convert_outputs_to_dict(self):
+        """This will convert the outputs to a dictionary"""
+        if isinstance(self.config.outputs, dict) == False:
+            self.config.outputs = {
+                key: self.config.outputs[key] for key in self.config.outputs
+            }
 
     def build_rkt_jacobian(self, block):
         """this will build rkt jacboian on specified block.
@@ -778,6 +867,7 @@ class ReaktoroBlockData(ProcessBlockData):
             presolve = self.config.reaktoro_presolve_options.presolve_speciation_block
         else:
             presolve = self.config.reaktoro_presolve_options.presolve_property_block
+
         block.rkt_solver.set_solver_options(
             tolerance=self.config.reaktoro_solve_options.solver_tolerance,
             epsilon=self.config.reaktoro_solve_options.epsilon,
@@ -786,10 +876,16 @@ class ReaktoroBlockData(ProcessBlockData):
             presolve_epsilon=self.config.reaktoro_presolve_options.epsilon,
             max_iters=self.config.reaktoro_solve_options.max_iterations,
             presolve_max_iters=self.config.reaktoro_presolve_options.max_iterations,
-            hessian_type=self.config.jacobian_options.hessian_type,
+            hessian_type=self.config.hessian_options.hessian_type,
+            bfgs_initialization_type=self.config.hessian_options.bfgs_initialization_type,
+            bfgs_init_min_hessian_value=self.config.hessian_options.bfgs_init_min_hessian_value,
+            bfgs_init_max_hessian_value=self.config.hessian_options.bfgs_init_max_hessian_value,
+            bfgs_init_const_hessian_value=self.config.hessian_options.bfgs_init_const_hessian_value,
+            bfgs_hessian_memory=self.config.hessian_options.bfgs_hessian_memory,
+            bfgs_epsilon=self.config.hessian_options.bfgs_epsilon,
         )
 
-    def build_gray_box(self, block):
+    def build_gray_box(self, block, speciation_block=False):
         """this will build rkt outputs specified block.
         The keyword arguments are for automatic configuration of speciation and property blocks
 
@@ -797,31 +893,115 @@ class ReaktoroBlockData(ProcessBlockData):
         block -- pyomo block to build the model on
         """
         # build block
-        scaling = self.config.jacobian_options.user_scaling
-        scaling_type = self.config.jacobian_options.scaling_type
-        block.rkt_block_builder = ReaktoroBlockBuilder(
-            block, block.rkt_solver, build_on_init=False
-        )
-        block.rkt_block_builder.configure_jacobian_scaling(
-            jacobian_scaling_type=scaling_type, user_scaling=scaling
-        )
-        if self.config.reaktoro_block_manager is not None:
-            managed_block = self.config.reaktoro_block_manager.register_block(
-                state=block.rkt_state,
-                inputs=block.rkt_inputs,
-                outputs=block.rkt_outputs,
-                jacobian=block.rkt_jacobian,
-                solver=block.rkt_solver,
-                builder=block.rkt_block_builder,
-            )
-            block.managed_block = managed_block
+
+        if (
+            self.config.reaktoro_block_manager is not None
+            and hasattr(self, "speciation_block_data") == False
+        ):
+            self.speciation_block_data = []
+        if self.direct_coupling_mode:
+            if speciation_block:
+                if (
+                    hasattr(block, "rkt_solver") == False
+                    and self.config.external_speciation_reaktoro_blocks is not None
+                ):
+                    working_block = self.config.external_speciation_reaktoro_blocks[0]
+                    block.rkt_state = working_block.rkt_state
+                    block.rkt_inputs = working_block.rkt_inputs
+                    block.rkt_outputs = working_block.rkt_outputs
+                    block.rkt_jacobian = working_block.rkt_jacobian
+                    block.rkt_solver = working_block.rkt_solver
+                    self.config.external_speciation_reaktoro_blocks.pop(0)
+                elif (
+                    hasattr(block, "rkt_solver") == False
+                    and self.config.external_speciation_reaktoro_blocks is None
+                ):
+                    raise ValueError(
+                        "Direct coupling mode is enabled, but no speciation block is provided."
+                    )
+
+                solver_blocks = [block.rkt_solver]
+
+                if self.config.external_speciation_reaktoro_blocks is not None:
+                    for spc in self.config.external_speciation_reaktoro_blocks:
+                        if spc != block:
+                            solver_blocks.append(spc.rkt_solver)
+                self.coupled_solver = ReaktoroCoupledSolver(solver_blocks)
+                block.outputs = self.coupled_solver.outputs
+
+                solver = None
+                if self.config.reaktoro_block_manager is not None:
+                    self.speciation_block_data.append(
+                        {
+                            "state": block.rkt_state,
+                            "inputs": block.rkt_inputs,
+                            "outputs": block.rkt_outputs,
+                            "jacobian": block.rkt_jacobian,
+                            "solver": block.rkt_solver,
+                        }
+                    )
+                    if self.config.external_speciation_reaktoro_blocks is not None:
+                        for spc in self.config.external_speciation_reaktoro_blocks:
+                            self.speciation_block_data.append(
+                                {
+                                    "state": spc.rkt_state,
+                                    "inputs": spc.rkt_inputs,
+                                    "outputs": spc.rkt_outputs,
+                                    "jacobian": spc.rkt_jacobian,
+                                    "solver": spc.rkt_solver,
+                                }
+                            )
+            else:
+                self.coupled_solver.register_property_solver(block.rkt_solver)
+                solver = self.coupled_solver
+                prop_block_data = {
+                    "state": block.rkt_state,
+                    "inputs": block.rkt_inputs,
+                    "outputs": block.rkt_outputs,
+                    "jacobian": block.rkt_jacobian,
+                    "solver": block.rkt_solver,
+                }
         else:
-            block.rkt_block_builder.build_reaktoro_block()
+            solver = block.rkt_solver
+            prop_block_data = None
+        if solver is not None:
+            block.rkt_block_builder = ReaktoroBlockBuilder(
+                block, solver, build_on_init=False
+            )
+            block.rkt_block_builder.configure_jacobian_scaling(
+                jacobian_scaling_type=self.config.jacobian_options.scaling_type,
+                user_scaling=self.config.jacobian_options.user_scaling,
+                jacobian_scaling_bounds=self.config.jacobian_options.jacobian_scale_bounds,
+                update_jacobian_scale_every_solve=self.config.jacobian_options.update_jacobian_scale_every_solve,
+                jacobian_scaling_bounds_output_based=self.config.jacobian_options.jacobian_scaling_bounds_output_based,
+            )
+
+            if self.config.reaktoro_block_manager is not None:
+                if self.direct_coupling_mode:
+                    managed_block = self.config.reaktoro_block_manager.register_block(
+                        inputs=solver.input_specs,
+                        outputs=solver.output_specs,
+                        builder=block.rkt_block_builder,
+                        speciation_block=self.speciation_block_data,
+                        property_block=prop_block_data,
+                    )
+                else:
+                    managed_block = self.config.reaktoro_block_manager.register_block(
+                        state=block.rkt_state,
+                        inputs=block.rkt_inputs,
+                        outputs=block.rkt_outputs,
+                        jacobian=block.rkt_jacobian,
+                        solver=solver,
+                        builder=block.rkt_block_builder,
+                    )
+                block.managed_block = managed_block
+            else:
+                block.rkt_block_builder.build_reaktoro_block()
 
     # TODO: Update to provide output location (e.g. StringIO)
     def display_jacobian_outputs(self):
         """Displays jacobian output types"""
-        if self.config.build_speciation_block:
+        if self.config.build_speciation_block and self.direct_coupling_mode == False:
             _log.info("-----Displaying information for speciation block ------")
             self.speciation_block.rkt_jacobian.display_jacobian_output_types()
         _log.info("-----Displaying information for property block ------")
@@ -831,7 +1011,7 @@ class ReaktoroBlockData(ProcessBlockData):
     def display_jacobian_scaling(self):
         """Displays jacobian scaling"""
         jacobian_scaling = {}
-        if self.config.build_speciation_block:
+        if self.config.build_speciation_block and self.direct_coupling_mode == False:
             _log.info("-----Displaying information for speciation block ------")
             jac_scale = (
                 self.speciation_block.rkt_block_builder.display_jacobian_scaling()
@@ -845,11 +1025,33 @@ class ReaktoroBlockData(ProcessBlockData):
     # TODO:# Update to provide output location (e.g. StringIO)
     def display_reaktoro_state(self):
         """Displays reaktoro state"""
-        if self.config.build_speciation_block:
+        if self.config.build_speciation_block and self.direct_coupling_mode == False:
             _log.info("-----Displaying information for speciation block ------")
             self.speciation_block.rkt_block_builder.display_state()
         _log.info("-----Displaying information for property block ------")
         self.rkt_block_builder.display_state()
+
+    def update_block_scaling(self, update_on_speciation_block=True):
+        """This will update the scaling of input and output constraints on all blocks, can be
+        helpful when chemistry changes dramatically between solves.
+        Keywords:
+        update_on_speciation_block -- if scaling should be also updated on speciation block if built.
+        """
+        if (
+            self.config.build_speciation_block
+            and update_on_speciation_block
+            and self.direct_coupling_mode == False
+        ):
+            self.speciation_block.rkt_block_builder.initialize_input_variables_and_constraints(
+                use_default_scaling=False
+            )
+            self.speciation_block.rkt_block_builder.set_output_vars_and_scale(
+                use_default_scaling=False
+            )
+        self.rkt_block_builder.initialize_input_variables_and_constraints(
+            use_default_scaling=False
+        )
+        self.rkt_block_builder.set_output_vars_and_scale(use_default_scaling=False)
 
     def update_jacobian_scaling(
         self, user_scaling_dict=None, set_on_speciation_block=True
@@ -859,7 +1061,11 @@ class ReaktoroBlockData(ProcessBlockData):
         user_scaling_dict -- Dictionary that contains jacobian keys and scaling block
         set_on_speciation_block -- if scaling should be also set on speciation block if built.
         """
-        if self.config.build_speciation_block and set_on_speciation_block:
+        if (
+            self.config.build_speciation_block
+            and set_on_speciation_block
+            and self.direct_coupling_mode == False
+        ):
             self.speciation_block.rkt_block_builder.set_jacobian_scaling()
             self.speciation_block.rkt_block_builder.set_user_jacobian_scaling(
                 user_scaling_dict
@@ -878,7 +1084,7 @@ class ReaktoroBlockData(ProcessBlockData):
             presolve = True
         else:
             presolve = False
-        if self.config.build_speciation_block:
+        if self.config.build_speciation_block and self.direct_coupling_mode == False:
             _log.info(f"---initializing speciation block {str(self)}----")
             self.speciation_block.rkt_block_builder.initialize(presolve)
         _log.info(f"---initializing property block {str(self)}----")

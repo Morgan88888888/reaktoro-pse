@@ -10,14 +10,15 @@
 # "https://github.com/watertap-org/reaktoro-pse/"
 #################################################################################
 from reaktoro_pse.reaktoro_block import ReaktoroBlock
-
+from reaktoro_pse.core.util_classes.cyipopt_solver import (
+    get_cyipopt_watertap_solver,
+)
 from pyomo.environ import (
     ConcreteModel,
     Var,
     Constraint,
     units as pyunits,
 )
-from watertap_solvers import get_solver
 from pyomo.util.calc_var_value import calculate_variable_from_constraint
 import idaes.core.util.scaling as iscale
 
@@ -44,25 +45,25 @@ def build_modification_example(water_comp):
     # pressure.construct()
     m.feed_pH = Var(initialize=7.8, bounds=(4, 12), units=pyunits.dimensionless)
     m.feed_pH.fix(7.8)  # feed pH used in phreeqc sim
-    m.acid_addition = Var(initialize=0.0, units=pyunits.mol / pyunits.s)
+    m.acid_addition = Var(initialize=1e-8, units=pyunits.mol / pyunits.s)
     m.acid_addition.fix()
-    m.base_addition = Var(initialize=0.0, units=pyunits.mol / pyunits.s)
+    m.base_addition = Var(initialize=1e-8, units=pyunits.mol / pyunits.s)
     m.base_addition.fix()
-    m.lime_addition = Var(initialize=0.0, units=pyunits.mol / pyunits.s)
+    m.lime_addition = Var(initialize=1e-8, units=pyunits.mol / pyunits.s)
     m.lime_addition.fix()
     m.modified_properties_water_removal = Var(
-        initialize=0,
+        initialize=1e-8,
         units=pyunits.mol / pyunits.s,
     )
     m.water_recovery = Var(
-        initialize=0.0,
+        initialize=1e-8,
         bounds=(0.0, 0.9),
         units=pyunits.dimensionless,
     )
     m.water_recovery.fix()
     m.eq_water_flow = Constraint(
-        expr=m.water_recovery
-        == m.modified_properties_water_removal / m.feed_composition["H2O"]
+        expr=m.water_recovery * m.feed_composition["H2O"]
+        == m.modified_properties_water_removal
     )
     return m
 
@@ -98,15 +99,6 @@ def add_standard_properties(m):
         # we can use default converter as its defined for default database (Phreeqc and pitzer)
         # we are modifying state and must speciate inputs before adding acid to find final prop state.
         build_speciation_block=True,
-        # reaktoro_solve_options={"open_species_on_property_block": ["OH-", "H2O"]},
-        jacobian_options={
-            "user_scaling": {
-                ("saturationIndex", "Calcite"): 1,
-                ("saturationIndex", "Gypsum"): 1,
-                ("pH", None): 1,
-                ("speciesActivityLn", "H2O"): 1,
-            },
-        },
     )
     scale_model(m)
 
@@ -116,9 +108,9 @@ def scale_model(m):
         iscale.set_scaling_factor(
             m.feed_composition[key], 1 / m.feed_composition[key].value
         )
-    iscale.set_scaling_factor(m.water_recovery, 1 / 1)
-    iscale.set_scaling_factor(m.acid_addition, 1 / 0.001)
-    iscale.set_scaling_factor(m.base_addition, 1 / 0.001)
+    iscale.set_scaling_factor(m.water_recovery, 1)
+    iscale.set_scaling_factor(m.acid_addition, 1 / 0.00001)
+    iscale.set_scaling_factor(m.base_addition, 1 / 0.00001)
 
 
 def initialize(m):
@@ -126,10 +118,11 @@ def initialize(m):
         m.modified_properties_water_removal, m.eq_water_flow
     )
     m.eq_modified_properties.initialize()
+    m.display()
     solve(m)
 
 
 def solve(m):
-    cy_solver = get_solver(solver="cyipopt-watertap")
+    cy_solver = get_cyipopt_watertap_solver()  # get_solver(solver="cyipopt-watertap")
     result = cy_solver.solve(m, tee=True)
     return result

@@ -10,14 +10,13 @@
 # "https://github.com/watertap-org/reaktoro-pse/"
 #################################################################################
 
-import array
-from calendar import c
 import multiprocessing as mp
 from multiprocessing import shared_memory
 from multiprocessing import Pipe
 from reaktoro_pse.core.reaktoro_state import (
     ReaktoroState,
 )
+from reaktoro_pse.core.reaktoro_coupled_solver import ReaktoroCoupledSolver
 from reaktoro_pse.core.reaktoro_jacobian import (
     ReaktoroJacobianSpec,
 )
@@ -40,16 +39,13 @@ import idaes.logger as idaeslog
 _log = idaeslog.getLogger(__name__)
 
 
-class RemoteWorker:
-    def __init__(
-        self,
-        config_data,
-        input_reference,
-        output_reference,
-        jacobian_reference,
-    ):
-        """build remote instance of reaktoro state and solver for execution in
-        its own process"""
+class RktModelData:
+    def __init__(self, config_data):
+        """Initialize the Reaktoro state with the provided configuration data."""
+
+        self.build_state(config_data)
+
+    def build_state(self, config_data):
         state_config, input_config, output_config, jacobian_config, solver_config = (
             config_data
         )
@@ -67,38 +63,80 @@ class RemoteWorker:
             self.state, self.inputs, self.outputs, self.jacobian
         )
         self.solver.load_from_export_object(solver_config)
+
+
+class RemoteWorker:
+    def __init__(
+        self,
+        config_data,
+        input_reference,
+        output_reference,
+        jacobian_reference,
+    ):
+        """build remote instance of reaktoro state and solver for execution in
+        its own process"""
+
+        self.process_config_data(config_data)
+
         self.param_dict = {}
         self.input_reference = shared_memory.SharedMemory(name=input_reference)
         self.output_reference = shared_memory.SharedMemory(name=output_reference)
         self.jacobian_reference = shared_memory.SharedMemory(name=jacobian_reference)
         self.input_matrix = np.ndarray(
-            (3, len(self.inputs.rkt_inputs.keys())),
+            (3, len(self.solver.input_specs.rkt_inputs.keys())),
             dtype=np.float64,
             buffer=self.input_reference.buf,
         )
         self.old_matrix = None  # np.zeros(len(self.inputs.rkt_inputs.keys()))
         self.jacobian_matrix = np.ndarray(
             (
-                len(self.outputs.rkt_outputs.keys()),
-                len(self.inputs.rkt_inputs.keys()),
+                len(self.solver.output_specs.rkt_outputs.keys()),
+                len(self.solver.input_specs.rkt_inputs.keys()),
             ),
             dtype=np.float64,
             buffer=self.jacobian_reference.buf,
         )
 
         self.output_matrix = np.ndarray(
-            len(self.outputs.rkt_outputs.keys()),
+            len(self.solver.output_specs.rkt_outputs.keys()),
             dtype=np.float64,
             buffer=self.output_reference.buf,
         )
         self.params = {}
         self.old_params = {}
 
+    def process_config_data(self, config_data):
+        """process config data to extract state, inputs, outputs, jacobian and solver"""
+        if isinstance(config_data, list):
+            self.rkt_model = RktModelData(config_data)
+            self.solver = self.rkt_model.solver
+        elif isinstance(config_data, dict):
+            spc_solvers = []
+            for key in config_data:
+                if key != "property_block":
+                    setattr(self, key, RktModelData(config_data[key]))
+                    spc_solvers.append(getattr(self, key).solver)
+                else:
+                    self.property_block = RktModelData(config_data[key])
+
+            self.solver = ReaktoroCoupledSolver(spc_solvers)
+            self.solver.register_property_solver(
+                self.property_block.solver,
+            )
+            for key, obj in self.property_block.solver.input_specs.rkt_inputs.items():
+                if obj.dummy_var_key is not None:
+                    obj.dummy_var = self.solver.outputs[obj.dummy_var_key]
+
+        else:
+            raise TypeError(
+                "config_data must be a tuple or a dictionary containing the configuration data"
+            )
+
     def initialize(self, presolve=False):
         _log.info("Initialized in remote worker")
 
         self.update_inputs()
-        self.state.equilibrate_state()
+        self.solver.equilibrate_state()
         jacobian, outputs = self.solver.solve_reaktoro_block(presolve=presolve)
         self.update_output_matrix(outputs, jacobian)
 
@@ -108,6 +146,7 @@ class RemoteWorker:
                 self.get_params()
                 jacobian, outputs = self.solver.solve_reaktoro_block(self.params)
                 self.update_output_matrix(outputs, jacobian)
+
             return WorkerMessages.success
         except cyipopt.CyIpoptEvaluationError:
             return WorkerMessages.CyIpoptEvaluationError
@@ -119,11 +158,11 @@ class RemoteWorker:
         np.copyto(self.jacobian_matrix, jacobian)
 
     def get_params(self):
-        for i, key in enumerate(self.inputs.rkt_inputs.keys()):
+        for i, key in enumerate(self.solver.input_specs.rkt_inputs.keys()):
             self.params[key] = self.input_matrix[2][i]
 
     def display_state(self):
-        print(self.state.state)
+        print(self.solver.display_state())
 
     def check_solve(self):
         if self.old_matrix is None:
@@ -140,10 +179,11 @@ class RemoteWorker:
                 return False
 
     def update_inputs(self):
-        for i, key in enumerate(self.inputs.rkt_inputs.keys()):
-
-            self.inputs.rkt_inputs[key].value = self.input_matrix[0][i]
-            self.inputs.rkt_inputs[key].converted_value = self.input_matrix[1][i]
+        for i, key in enumerate(self.solver.input_specs.rkt_inputs.keys()):
+            self.solver.input_specs.rkt_inputs[key].value = self.input_matrix[0][i]
+            self.solver.input_specs.rkt_inputs[key].converted_value = self.input_matrix[
+                1
+            ][i]
 
     def close_shared_memory(self):
         # clean up memory on termination
@@ -225,12 +265,13 @@ class LocalWorker:
                 self.worker_data.inputs.rkt_inputs[key].get_value()
             )
             self.input_matrix[1][i] = np.float64(
-                self.worker_data.inputs.rkt_inputs[key].get_value(apply_conversion=True)
+                self.worker_data.inputs.rkt_inputs[key].get_value(
+                    apply_conversion=True,
+                )
             )
         self.local_pipe.send((WorkerMessages.initialize, presolve))
 
         result = self.local_pipe.recv()
-        # we want to block here.
 
         if result == WorkerMessages.success:
             self.update_outputs()
@@ -269,6 +310,9 @@ class LocalWorker:
         self.local_pipe.send(WorkerMessages.terminate)
         _log.info("Worker terminated")
 
+    def get_jacobian_matrix_function(self):
+        return self.jacobian_matrix.copy()
+
 
 class ReaktoroParallelManager:
     def __init__(self, time_out):
@@ -290,6 +334,9 @@ class ReaktoroParallelManager:
 
     def get_display_function(self, block_idx):
         return self.registered_workers[block_idx].display_state
+
+    def get_jacobian_matrix_function(self, block_idx):
+        return self.registered_workers[block_idx].get_jacobian_matrix_function
 
     def start_workers(self):
         for idx, local_worker in self.registered_workers.items():

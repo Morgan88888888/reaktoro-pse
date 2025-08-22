@@ -10,22 +10,26 @@
 # "https://github.com/watertap-org/reaktoro-pse/"
 #################################################################################
 from reaktoro_pse.reaktoro_block import ReaktoroBlock
-
+from reaktoro_pse.core.util_classes.cyipopt_solver import (
+    get_cyipopt_watertap_solver,
+)
 from pyomo.environ import (
     ConcreteModel,
     Var,
     Objective,
     Constraint,
+    assert_optimal_termination,
     units as pyunits,
 )
 
-from watertap_solvers import get_solver
 from pyomo.util.calc_var_value import calculate_variable_from_constraint
 
 import idaes.core.util.scaling as iscale
 
+from reaktoro_pse.parallel_tools.reaktoro_block_manager import (
+    ReaktoroBlockManager,
+)
 
-import reaktoro as rkt
 
 __author__ = "Alexander V. Dudchenko"
 
@@ -42,21 +46,18 @@ __author__ = "Alexander V. Dudchenko"
 # assumption for evaporative processes.
 
 
-def main():
-    m = build_simple_desal()
-    m_open = build_simple_desal(True)
+def main(
+    hess_type=None,
+):
+    m = build_simple_desal(hess_type)
     initialize(m)
-    initialize(m_open)
     setup_optimization(m)
-    setup_optimization(m_open)
     print("---result with out extra open species---")
     solve(m)
-    print("---result with open extra open species---")
-    solve(m_open)
-    return m, m_open
+    return m
 
 
-def build_simple_desal(open_species=False):
+def build_simple_desal(hess_type, parallel_mode=False):
     m = ConcreteModel()
     m.feed_composition = Var(
         ["H2O", "Mg", "Na", "Cl", "SO4", "Ca", "HCO3"],
@@ -130,24 +131,20 @@ def build_simple_desal(open_species=False):
     m.eq_water_recovery = Constraint(
         expr=m.water_recovery == m.desal_product_flow / m.feed_composition["H2O"]
     )
-    if open_species:
 
-        # Example for opening additional species to improve
-        # reaktoro solver stability,
-        # Note how this does not alter reaktoro output results as
-        # the H+ and OH- is already constrained by total H amount in property
-        # block, as such the DOFs are still zero.
-
-        # However, this can result in incorrect speciation for some databases, so please use with caution.
-
-        species_to_open = ["OH-"]
+    if parallel_mode:
+        m.parallel_block_manager = ReaktoroBlockManager()
     else:
-        species_to_open = None
+        m.parallel_block_manager = None
+    if hess_type is None:
+        hess_options = {}
+    else:
+        hess_options = {"hessian_type": hess_type}
     m.eq_desal_properties = ReaktoroBlock(
         aqueous_phase={
             "composition": m.desal_composition,
             "convert_to_rkt_species": True,
-            "activity_model": rkt.ActivityModelPitzer(),
+            "activity_model": "ActivityModelPitzer",
         },
         system_state={
             "temperature": m.feed_temperature,
@@ -156,12 +153,15 @@ def build_simple_desal(open_species=False):
         },
         outputs=m.desal_properties,
         chemistry_modifier={"HCl": m.acid_addition},
-        dissolve_species_in_reaktoro=True,
         # we can use default converter as its defined for default database (Phreeqc and pitzer)
         # we are modifying state and must speciate inputs before adding acid to find final prop state.
         build_speciation_block=True,
-        reaktoro_solve_options={"open_species_on_property_block": species_to_open},
+        reaktoro_block_manager=m.parallel_block_manager,
+        hessian_options=hess_options,
     )
+    # assert False
+    if parallel_mode:
+        m.parallel_block_manager.build_reaktoro_blocks()
     scale_model(m)
     return m
 
@@ -185,13 +185,14 @@ def initialize(m):
             m.desal_composition[key], m.eq_desal_composition[key]
         )
     m.eq_desal_properties.initialize()
+    m.eq_desal_properties.display_jacobian_scaling()
     solve(m)
 
 
 def setup_optimization(m):
     m.objective = Objective(expr=(1 - m.water_recovery) * 10 + m.acid_addition)
     m.desal_properties[("scalingTendency", "Calcite")].setub(1)
-    m.desal_properties[("scalingTendency", "Gypsum")].setub(1)
+    # m.desal_properties[("scalingTendency", "Gypsum")].setub(1)
     m.water_recovery.unfix()
     m.acid_addition.unfix()
 
@@ -205,12 +206,10 @@ def display_results(m):
 
 
 def solve(m):
-    cy_solver = get_solver(solver="cyipopt-watertap")
-    # cy_solver.options["max_iter"] = 200
-    # only enable if avaialbe !
-    # cy_solver.options["linear_solver"] = "ma27"
+    cy_solver = get_cyipopt_watertap_solver()
     result = cy_solver.solve(m, tee=True)
     display_results(m)
+    assert_optimal_termination(result)
     return result
 
 

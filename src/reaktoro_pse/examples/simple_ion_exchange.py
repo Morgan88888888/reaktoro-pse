@@ -10,16 +10,17 @@
 # "https://github.com/watertap-org/reaktoro-pse/"
 #################################################################################
 from reaktoro_pse.reaktoro_block import ReaktoroBlock
-
+from reaktoro_pse.core.util_classes.cyipopt_solver import (
+    get_cyipopt_watertap_solver,
+)
 from pyomo.environ import (
     ConcreteModel,
     Var,
     Objective,
     Constraint,
+    assert_optimal_termination,
     units as pyunits,
 )
-from watertap_solvers import get_solver
-from pyomo.util.calc_var_value import calculate_variable_from_constraint
 
 import idaes.core.util.scaling as iscale
 import pyomo.environ as pyo
@@ -36,15 +37,21 @@ __author__ = "Alexander V. Dudchenko"
 # (4) Optimize addition of acid and bases for maximizing Calcium removal selectivity over Magnesium
 
 
-def main():
-    m = build_simple_desal()
+def main(
+    hess_type=None,
+):
+    m = build_simple_ix(
+        hess_type=None,
+    )
     initialize(m)
     setup_optimization(m)
     solve(m)
     return m
 
 
-def build_simple_desal():
+def build_simple_ix(
+    hess_type=None,
+):
     m = ConcreteModel()
     m.feed_composition = Var(
         ["H2O", "Mg", "Na", "Cl", "SO4", "Ca", "HCO3"],
@@ -103,9 +110,15 @@ def build_simple_desal():
     m.ion_exchange_material["NaX"].fix(0.4)
     m.ion_exchange_material["CaX2"].fix(1e-5)
     m.ion_exchange_material["MgX2"].fix(1e-5)
+    if hess_type is None:
+        hess_options = {}
+    else:
+        hess_options = {"hessian_type": hess_type}
 
-    # We will build a block to charge neutralize the feed and adjust apparent species
-    # to achieve this and then build a separate block to do ion exchange calculation
+    # we wil first configure a reaktoro block to solve for charge balanced feed, this will
+    # then be coupled directly with our ion exchange block which includes ion exchange addition
+    # note how on speciation block we do not build a gray box model, and on property block we include it in
+    # external_speciation_reaktoro_blocks
     m.eq_speciation_block = ReaktoroBlock(
         system_state={
             "temperature": m.feed_temperature,
@@ -118,12 +131,13 @@ def build_simple_desal():
             "activity_model": rkt.ActivityModelPitzer(),
         },
         outputs={
-            ("charge", None): m.feed_charge,
             "speciesAmount": True,
         },
         dissolve_species_in_reaktoro=True,
-        assert_charge_neutrality=False,
+        assert_charge_neutrality=True,
         build_speciation_block=False,
+        hessian_options=hess_options,
+        build_graybox_model=False,
     )
 
     # build the IX block
@@ -131,13 +145,8 @@ def build_simple_desal():
     # Note how we do not privde feed pH any more, as it will be estimated
     # from our specitated and charge balanced block aad adjusted due to addition of resin - which will
     # impact both charge balance and final pH of solution
-
-    m.eq_speciation_block.display_reaktoro_state()
-    m.eq_speciation_block.outputs.display()
     m.eq_ix_properties = ReaktoroBlock(
         aqueous_phase={
-            "composition": m.eq_speciation_block.outputs,
-            "convert_to_rkt_species": False,  # already exact
             "activity_model": rkt.ActivityModelPitzer(),
         },
         ion_exchange_phase={
@@ -154,13 +163,12 @@ def build_simple_desal():
         chemistry_modifier={"NaOH": m.base_addition, "HCl": m.acid_addition},
         dissolve_species_in_reaktoro=True,
         assert_charge_neutrality=False,
-        reaktoro_solve_options={
-            "solver_tolerance": 1e-12,
-            "open_species_on_property_block": ["OH-"],
-        },
-        # we do not need to re-speciate.
         exact_speciation=True,
         build_speciation_block=False,
+        hessian_options=hess_options,
+        external_speciation_reaktoro_blocks=[
+            m.eq_speciation_block
+        ],  #  method for specifying external speciation configuration
     )
     m.eq_ix_properties.display_reaktoro_state()
     # assert False
@@ -215,15 +223,13 @@ def build_simple_desal():
     @m.Constraint(list(m.treated_composition.keys()))
     def eq_removal(fs, ion):
         return (
-            m.removal_percent[ion]
-            == (m.treated_composition[ion] - m.feed_composition[ion])
-            / m.feed_composition[ion]
-            * 100
+            m.removal_percent[ion] * m.feed_composition[ion]
+            == (m.treated_composition[ion] - m.feed_composition[ion]) * 100
         )
 
     # Calculate Ca to Mg selectivity
     m.eq_selectivity = Constraint(
-        expr=m.Ca_to_Mg_selectivity == m.removal_percent["Ca"] / m.removal_percent["Mg"]
+        expr=m.Ca_to_Mg_selectivity * m.removal_percent["Mg"] == m.removal_percent["Ca"]
     )
     scale_model(m)
     return m
@@ -246,25 +252,18 @@ def scale_model(m):
         iscale.set_scaling_factor(m.used_ion_exchange_material[key], 10)
         iscale.constraint_scaling_transform(m.eq_used_ix[key], 10)
     iscale.constraint_scaling_transform(m.eq_selectivity, 10)
-    iscale.set_scaling_factor(m.acid_addition, 1e2)
-    iscale.set_scaling_factor(m.base_addition, 1e2)
+    iscale.set_scaling_factor(m.acid_addition, 1e3)
+    iscale.set_scaling_factor(m.base_addition, 1e3)
     iscale.set_scaling_factor(m.Ca_to_Mg_selectivity, 10)
-    iscale.set_scaling_factor(m.feed_charge, 1e8)
-    iscale.set_scaling_factor(m.treated_feed_charge, 1e8)
+    iscale.set_scaling_factor(m.feed_charge, 1e-4)
+    iscale.set_scaling_factor(m.treated_feed_charge, 1e-4)
 
 
 def initialize(m):
-    m.eq_speciation_block.initialize()
+    # m.eq_speciation_block.initialize()
     m.eq_ix_properties.initialize()
     m.eq_ix_properties.display_jacobian_scaling()
     m.eq_ix_properties.display_reaktoro_state()
-    for key in m.treated_composition:
-        calculate_variable_from_constraint(
-            m.treated_composition[key], m.eq_treated_comp[key]
-        )
-    # Unfix our feed Cl and fix charge to zero so we can charge neutralize the feed
-    m.feed_composition["Cl"].unfix()
-    m.feed_charge.fix(0)
     solve(m)
 
 
@@ -279,6 +278,9 @@ def setup_optimization(m):
     )
     m.base_addition.unfix()
     m.acid_addition.fix()
+
+    m.base_addition.setlb(1e-2)
+    m.base_addition = 0.01
     m.removal_percent["Mg"].setub(-10)
     m.removal_percent["Ca"].setub(-10)
 
@@ -299,12 +301,10 @@ def display_results(m):
 
 
 def solve(m):
-    cy_solver = get_solver(solver="cyipopt-watertap")
-    cy_solver.options["max_iter"] = 100
-    # only enable if avaialbe !
-    # cy_solver.options["linear_solver"] = "ma27"
+    cy_solver = get_cyipopt_watertap_solver(limited_memory=False)
     result = cy_solver.solve(m, tee=True)
     display_results(m)
+    assert_optimal_termination(result)
     return result
 
 

@@ -10,7 +10,6 @@
 # "https://github.com/watertap-org/reaktoro-pse/"
 #################################################################################
 import reaktoro as rkt
-
 import numpy as np
 from reaktoro_pse.core.reaktoro_outputs import PropTypes
 from reaktoro_pse.core.reaktoro_state import ReaktoroState
@@ -18,13 +17,13 @@ from reaktoro_pse.core.util_classes.rkt_inputs import RktInputTypes
 from reaktoro_pse.core.reaktoro_outputs import (
     ReaktoroOutputSpec,
 )
-
 import idaes.logger as idaeslog
 
 _log = idaeslog.getLogger(__name__)
 
 __author__ = "Alexander V. Dudchenko, Paul Vecchiarelli, Ben Knueven"
 
+import time
 
 # class to setup jacobian for reaktoro
 
@@ -34,6 +33,7 @@ class JacType:
     center_difference = "center_difference"
     exact = "exact"
     numeric = "numeric"
+    calculated = "calculated"
 
 
 class JacboianRows:
@@ -158,6 +158,7 @@ class JacboianRows:
                 prop, self.property[idx], self.property_index[idx]
             )
         self.absolute_values[idx] = val
+        return val
 
     def get_value(self, key):
         """eval jacobian using specified function other wise return 0"""
@@ -177,7 +178,7 @@ class JacboianRows:
 
 class ReaktoroJacobianExport:
     def __init__(self):
-        self.der_step_size = None
+        self.numerical_step = None
         self.jacobian_type = None
         self.numerical_order = None
 
@@ -190,14 +191,21 @@ class ReaktoroJacobianSpec:
         self.output_specs = reaktor_outputs
         if isinstance(self.output_specs, ReaktoroOutputSpec) == False:
             raise TypeError("Reator outputs require ReaktoroOutputSpec class")
+
         self.jac_rows = JacboianRows(self.state.state)
+        self.jac_values = np.zeros((len(self.jac_rows.standard_keys), 1))
+        self.jac_idx_ref = {
+            key: idx for idx, key in enumerate(self.jac_rows.standard_keys)
+        }
+        self.der_step_multipliers = {}
+        self.inexact_jacobian = False
         self.set_jacobian_type()
         self.configure_numerical_jacobian()
         self.check_existing_jacobian_props()
 
     def export_config(self):
         export_object = ReaktoroJacobianExport()
-        export_object.der_step_size = self.der_step_size
+        export_object.der_step_size = self.numerical_step
         export_object.jacobian_type = self.jacobian_type
         export_object.numerical_order = self.numerical_order
         return export_object
@@ -210,7 +218,10 @@ class ReaktoroJacobianSpec:
         )
 
     def configure_numerical_jacobian(
-        self, jacobian_type="average", order=4, step_size=1e-8
+        self,
+        jacobian_type="average",
+        order=4,
+        step_size=1e-8,
     ):
         """Configure numerical derivate options
 
@@ -219,16 +230,21 @@ class ReaktoroJacobianSpec:
         order -- order of derivative
         step_size -- numerical step size for approximating derivative
         """
-        self.der_step_size = step_size
+        self.numerical_step = step_size
         self.jacobian_type = JacType.average
         self.numerical_order = order
         if jacobian_type == JacType.average:
             self.jacobian_type = JacType.average
             assert order % 2 == 0
-            self.numerical_steps = np.arange(-order / 2, order / 2 + 1) * step_size
+            self.numerical_steps = np.arange(-order / 2, order / 2 + 1)
         if jacobian_type == JacType.center_difference:
             self.jacobian_type = JacType.center_difference
             self.center_diff_order(order)
+        self.jac_numerical_steps = np.repeat(
+            self.numerical_steps[np.newaxis, :],
+            len(self.jac_rows.standard_keys),
+            axis=0,
+        )
         self.set_up_chem_and_aq_states()
 
     def set_up_chem_and_aq_states(self):
@@ -242,10 +258,11 @@ class ReaktoroJacobianSpec:
                 )
 
     def update_states(self, new_states):
-        for i in range(len(self.numerical_steps)):
-            self.chem_prop_states[i].update(new_states[:, i])
-            if RktInputTypes.aqueous_phase in self.state.inputs.registered_phases:
-                self.aqueous_prop_states[i].update(self.chem_prop_states[i])
+        if self.inexact_jacobian:
+            for i in range(len(self.numerical_steps)):
+                self.chem_prop_states[i].update(new_states[:, i])
+                if RktInputTypes.aqueous_phase in self.state.inputs.registered_phases:
+                    self.aqueous_prop_states[i].update(self.chem_prop_states[i])
 
     def get_state_values(self, output_object):
         output_vals = []
@@ -265,8 +282,8 @@ class ReaktoroJacobianSpec:
 
     def set_jacobian_type(self):
         """function to check all inputs and identify if exact or numeric jacobian should be used"""
-        _jac_types = []
-        for key, obj in self.output_specs.rkt_outputs.items():
+
+        def check_jac(prop, obj):
             jac_available = self.jac_rows.check_key(
                 obj.property_name, obj.property_index
             )
@@ -274,7 +291,16 @@ class ReaktoroJacobianSpec:
                 obj.jacobian_type = JacType.exact
             else:
                 obj.jacobian_type = JacType.numeric
-            _jac_types.append(f"{key}: {obj.jacobian_type}")
+                self.inexact_jacobian = True
+
+        # check all inputs and set jacobian type
+        for key, obj in self.output_specs.rkt_outputs.items():
+            if obj.calculation_options is not None:
+                obj.jacobian_type = JacType.calculated
+                for idx, calc_obj in obj.calculation_options.properties.items():
+                    check_jac(calc_obj.property_name, calc_obj)
+            else:
+                check_jac(obj.property_name, obj)
 
     def display_jacobian_output_types(self):
         """used for displaying jac output types"""
@@ -307,85 +333,127 @@ class ReaktoroJacobianSpec:
         """' used to update absolute values of jacobian - needed for numeric derivatives"""
         prop = self.output_specs.supported_properties[PropTypes.chem_prop]
         for jacIdx, key in enumerate(self.jac_rows.standard_keys):
-            self.jac_rows.compute_value(prop, key)
+            value = self.jac_rows.compute_value(prop, key)
+            self.jac_values[jacIdx] = value
 
-    def process_jacobian_matrix(self, jacobian_matrix, input_index, input_value):
+    def process_jacobian_matrix(self, input_value, step_size):
         """this function is used to pull out a specific column from the jacobian and also
         generate matrix for manually propagating derivatives
         Here we need to retain row order, as its same as input into chem properties"""
-        jacobian_abs_matrix = []
-        jacobian_dict = {}
-        for jacIdx, key in enumerate(self.jac_rows.standard_keys):
-            jacobian_abs_matrix.append([])
-            jac_abs_value = self.jac_rows.get_value(key)
-            jac_value = jacobian_matrix[jacIdx][input_index]
-            jacobian_dict[key] = jac_value
-
-            for step in self.numerical_steps:
-                der_step = jac_value * input_value * step
-                jacobian_abs_matrix[-1].append(jac_abs_value + der_step)
-        return jacobian_dict, np.array(jacobian_abs_matrix)
+        jacobian_abs_matrix = self.jac_values + (
+            self.partial_jac_vals.reshape(-1, 1)
+            * input_value
+            * step_size
+            * self.jac_numerical_steps
+        )
+        return jacobian_abs_matrix
 
     def get_jacobian(self, jacobian_matrix, input_object):
         input_index = input_object.get_jacobian_index()
         input_value = input_object.get_temp_value()
-        jacobian_dict, jacobian_abs_matrix = self.process_jacobian_matrix(
-            jacobian_matrix, input_index, input_value
+        if isinstance(self.numerical_step, float):
+            step_size = self.numerical_step
+        elif isinstance(self.numerical_step, dict):
+            if RktInputTypes.pH == input_object.var_name:
+                step_size = self.numerical_step[RktInputTypes.pH]
+            elif RktInputTypes.temperature == input_object.var_name:
+                step_size = self.numerical_step[RktInputTypes.temperature]
+            elif RktInputTypes.pressure == input_object.var_name:
+                step_size = self.numerical_step[RktInputTypes.pressure]
+            elif RktInputTypes.enthalpy == input_object.var_name:
+                step_size = self.numerical_step[RktInputTypes.enthalpy]
+            else:
+                step_size = self.numerical_step[RktInputTypes.species]
+
+        else:
+            raise TypeError(
+                f"Numerical step should be either float or dict, got {type(self.numerical_step)}"
+            )
+
+        def get_derivative(input_value, step_size, output_obj):
+            """function to get numerical derivative for output object"""
+            values = np.array(self.get_state_values(output_obj))
+            diff = np.diff(values)
+
+            if diff[diff == 0].size > 0:
+                return 0
+            elif JacType.average == self.jacobian_type:
+                if input_value != 0:
+                    step = np.diff(self.numerical_steps * step_size * input_value)
+                else:
+                    step = np.diff(self.numerical_steps * step_size)
+                dir_value = np.average(diff[diff != 0] / step[diff != 0])
+            elif JacType.center_difference == self.jacobian_type:
+                dir_value = np.array(values) * self.cdf_multipliers
+                if input_value != 0:
+                    dir_value = np.sum(dir_value) / (input_value * step_size)
+                else:
+                    dir_value = np.sum(dir_value) / (step_size)
+
+            return dir_value
+
+        def get_jac(output_obj, input_value, step_size):
+            """function to get exact or numerical jacobian value for output object"""
+            if output_obj.jacobian_type == JacType.exact:
+                jac_val = self.partial_jac_vals[
+                    self.jac_idx_ref[output_obj.jacobian_index]
+                ]
+            else:
+                jac_val = get_derivative(input_value, step_size, output_obj)
+
+            return jac_val
+
+        self.partial_jac_vals = jacobian_matrix[:, input_index]
+        output_jacobian = []
+        jacobian_abs_matrix = self.process_jacobian_matrix(
+            input_value,
+            step_size,
         )
         self.update_states(jacobian_abs_matrix)
 
-        output_jacobian = []
         for output_key, output_obj in self.output_specs.rkt_outputs.items():
-            if output_obj.jacobian_type == JacType.exact:
-                output_jacobian.append(jacobian_dict[output_key])
+            if output_obj.jacobian_type == JacType.calculated:
+                for idx, calc_obj in output_obj.calculation_options.properties.items():
+                    calc_obj.set_derivative(get_jac(calc_obj, input_value, step_size))
+                jac_val = output_obj.get_calculated_jacobian_value()
             else:
-                values = self.get_state_values(output_obj)
-                if JacType.average:
-                    diff = np.diff(values)
-                    step = np.diff(self.numerical_steps * input_value)
-                    jac_val = np.average(diff / step)
-                elif JacType.center_difference:
-                    jac_val = np.array(values) * self.cdf_multipliers
-                    jac_val = np.sum(jac_val) / (
-                        self.rkt_aqueous_props_der_step * input_value
-                    )
-                output_jacobian.append(jac_val)
+                jac_val = get_jac(output_obj, input_value, step_size)
+            output_jacobian.append(jac_val)
         return output_jacobian
 
     def center_diff_order(self, order):
-        """paramterizes center different taylor series
+        """parametrizes center different taylor series
         refer to https://en.wikipedia.org/wiki/Finite_difference_coefficient"""
 
         if order == 2:
-            self.numerical_steps = (
-                np.array(
-                    [
-                        -1,
-                        1,
-                    ]
-                )
-                * self.der_step_size
+            self.numerical_steps = np.array(
+                [
+                    -1,
+                    1,
+                ]
             )
-            self.cdf_multipliers = np.array([-1 / 2, 1 / 2])
+            self.cdf_multipliers = np.array([-1 / 2, 1 / 2], dtype=float)
         if order == 4:
-            self.numerical_steps = np.array([-2, -1, 1, 2]) * self.der_step_size
-            self.cdf_multipliers = np.array([-1 / 12, 2 / 3, -2 / 3, 1 / 12])
-        if order == 6:
-            self.numerical_steps = np.array([-3, -2, -1, 1, 2, 3]) * self.der_step_size
+            self.numerical_steps = np.array([-2, -1, 1, 2])
             self.cdf_multipliers = np.array(
-                [-1 / 60, 3 / 20, -3 / 4, 3 / 4, -3 / 20, 1 / 60]
+                [1 / 12, -2 / 3, 2 / 3, -1 / 12], dtype=float
+            )
+        if order == 6:
+            self.numerical_steps = np.array([-3, -2, -1, 1, 2, 3])
+            self.cdf_multipliers = np.array(
+                [-1 / 60, 3 / 20, -3 / 4, 3 / 4, -3 / 20, 1 / 60], dtype=float
             )
         if order == 8:
-            self.numerical_steps = (
-                np.array([-4, -3, -2, -1, 1, 2, 3, 4]) * self.der_step_size
-            )
+            self.numerical_steps = np.array([-4, -3, -2, -1, 1, 2, 3, 4])
             self.cdf_multipliers = np.array(
-                [1 / 280, -4 / 105, 1 / 5, -4 / 5, 4 / 5, -1 / 5, 4 / 105, -1 / 280]
+                [1 / 280, -4 / 105, 1 / 5, -4 / 5, 4 / 5, -1 / 5, 4 / 105, -1 / 280],
+                dtype=float,
             )
         if order == 10:
-            self.numerical_steps = (
-                np.array([-5, -4, -3, -2, -1, 1, 2, 3, 4, 5]) * self.der_step_size
-            )
+            self.numerical_steps = np.array([-5, -4, -3, -2, -1, 1, 2, 3, 4, 5])
             self.cdf_multipliers = (
-                np.array([-2, 25, -150, 600, -2100, 2100, -600, 150, -25, 2]) / 2520
+                np.array(
+                    [-2, 25, -150, 600, -2100, 2100, -600, 150, -25, 2], dtype=float
+                )
+                / 2520
             )

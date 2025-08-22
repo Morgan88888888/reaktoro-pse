@@ -1,7 +1,19 @@
+#################################################################################
+# WaterTAP Copyright (c) 2020-2024, The Regents of the University of California,
+# through Lawrence Berkeley National Laboratory, Oak Ridge National Laboratory,
+# National Renewable Energy Laboratory, and National Energy Technology
+# Laboratory (subject to receipt of any required approvals from the U.S. Dept.
+# of Energy). All rights reserved.
+#
+# Please see the files COPYRIGHT.md and LICENSE.md for full copyright and license
+# information, respectively. These files are also available online at the URL
+# "https://github.com/watertap-org/reaktoro-pse/"
+#################################################################################
+
 from pyomo.common.config import ConfigValue, IsInstance, ConfigDict
 from reaktoro_pse.core.reaktoro_jacobian import JacType
 from reaktoro_pse.core.reaktoro_block_builder import JacScalingTypes
-from reaktoro_pse.core.reaktoro_gray_box import HessTypes
+from reaktoro_pse.core.util_classes.rkt_inputs import RktInputTypes
 
 
 class JacobianOptions:
@@ -43,27 +55,74 @@ class JacobianOptions:
         CONFIG.declare(
             "numerical_step",
             ConfigValue(
-                default=1e-4,
-                domain=float,
-                description="Defines the step to use for numerical descritiazaiton",
+                default={
+                    RktInputTypes.pH: 1e-4,
+                    RktInputTypes.temperature: 1e-4,
+                    RktInputTypes.pressure: 1e-4,
+                    RktInputTypes.enthalpy: 1e-4,
+                    RktInputTypes.species: 1e-4,
+                },
+                domain=IsInstance((dict, float)),
+                description="Defines the step to use for numerical descritiazaiton based on input type, if None, automatically found",
                 doc="""This will define how small of a step to use for numerical derivative propagation which takes
-                the absolute chemical property and multiplies it by chemical property derivative multiplied by step 
-                    chemical_property_step=chemical_property_absolute_value*chemical_property_derivative*step
+                the absolute chemical property and multiplies it by chemical property derivative multiplied by step size. 
+                    chemical_property_step=chemical_input*chemical_property_derivative*step
                 """,
             ),
         )
+
         CONFIG.declare(
             "scaling_type",
             ConfigValue(
-                default=JacScalingTypes.variable_scaling,
+                default=JacScalingTypes.variable_oi_scaling_square_sum,
                 domain=IsInstance((str, JacScalingTypes)),
                 description="Defines how to scale Jacobian matrix",
                 doc="""
                 Defines methods for jacobian scaling:
-                - if option is no_scaling, jacobian scale will == 1 for all outputs
-                - if option is 'variable_scaling' will use output variable scaling factors
-                - if option is jacobian_matrix will use actual jac matrix to calculate scaling factors
-                - if user_scaling is not None then uses user provided scaling
+                - no_scaling -- jacobian scale == 1 for all outputs
+                - variable_output_scaling -- use output variable scaling factors (output_scale_i)                
+                - variable_oi_scaling_inverse_sum -- sum squared of output/input variable scaling factors output_scale_i/((sum(input_scales_i)**-1)**-1)
+                - variable_oi_scaling_square_sum --  (default) use inverse of sum squared of output/input variable scaling factors output_scale_i/((sum(input_scales_i)**2)**0.5)
+                - jacobian_matrix_inverse_sum -- use inverse of sum of absolute values of jacobian matrix
+                - jacobian_matrix_square_sum -- use squared sum of absolute values of jacobian matrix
+                - user_scaling -- Use user provided scaling
+                """,
+            ),
+        )
+        CONFIG.declare(
+            "jacobian_scale_bounds",
+            ConfigValue(
+                default=(1e-8, 1e2),
+                domain=IsInstance(tuple),
+                description="Defines lower and upper bounds for jacobian scaling factors",
+                doc="""
+                This will clip jacobian scale by defined upper and lower bound (min, max).   
+                Passing in None instead of a value will disable clipping for min or max (e.g. (None, 1e2) will disable lower bound clipping).             
+                """,
+            ),
+        )
+        CONFIG.declare(
+            "jacobian_scaling_bounds_output_based",
+            ConfigValue(
+                default=False,
+                domain=bool,
+                description="Defines if lower and upper bounds for jacobian scaling factors should be baseded on output scale",
+                doc="""
+                If True, the jacobian is clipped based on jacbian_scale_bounds multiplied by output variable scaling factors. 
+                If False, the jacobian is clipped based on jacbian_scale_bounds only.            
+                """,
+            ),
+        )
+        CONFIG.declare(
+            "update_jacobian_scale_every_solve",
+            ConfigValue(
+                default=False,
+                domain=bool,
+                description="Defines if jacobian scale should be updated every solve",
+                doc="""
+                This will recalculate jacobian scale every time a new solve is started. 
+                This only works if user updates output/input variable scaling between solves 
+                or if user uses any of the jacobian_matrix scaling methods, otherwise the jacobian scale factors will not change            
                 """,
             ),
         )
@@ -80,16 +139,6 @@ class JacobianOptions:
                 - dict that specifics output and scaling factor to which apply scaling, (variable_scaling will be applied to non specified outputs)
                     e.g. {output_name: scaling_factor} applies to specific jac output 
                 """,
-            ),
-        )
-        CONFIG.declare(
-            "hessian_type",
-            ConfigValue(
-                default="BFGS",
-                domain=IsInstance((str, HessTypes)),
-                description="Hessian type to use for reaktor gray box",
-                doc="""Hessian type to use, some might provide better stability
-                options (Jt.J, BFGS, BFGS-mod, BFGS-damp, BFGS-ipopt""",
             ),
         )
         return CONFIG
