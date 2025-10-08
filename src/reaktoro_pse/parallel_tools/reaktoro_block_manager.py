@@ -26,6 +26,10 @@ from idaes.core.base.process_base import declare_process_block_class, ProcessBlo
 from pyomo.common.config import ConfigValue, IsInstance
 from reaktoro_pse.reaktoro_block_config.hessian_options import HessianOptions
 
+from pyomo.environ import (
+    Constraint,
+)
+
 
 class ReaktoroBlockData:
     def __init__(self):
@@ -378,3 +382,23 @@ class ReaktoroBlockManagerData(ProcessBlockData):
     def terminate_workers(self):
         if self.config.use_parallel_mode:
             self.parallel_manager.terminate_workers()
+
+    def initialize(self):
+        """Initialize all managed blocks"""
+        for block in self.registered_blocks:
+            block.builder.block.initialize()
+
+    def deactivate(self, fix_outputs=True):
+        """Deactivates all constraints and grayboxes"""
+        super().deactivate()
+        for block in self.registered_blocks:
+            block.builder.block.deactivate(fix_outputs=fix_outputs)
+
+        self.reaktoro_model.deactivate()
+
+    def activate(self, unfix_outputs=True):
+        """Activates all constraints and grayboxes"""
+        super().activate()
+        for block in self.registered_blocks:
+            block.builder.block.activate(unfix_outputs=unfix_outputs)
+        self.reaktoro_model.activate()
